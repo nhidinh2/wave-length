@@ -1,8 +1,0 @@
-model,gross_pnl,net_pnl
-M0_constant,0.0,0.0
-M1N_ofi_normalized,0.0400000000000205,-0.0400000000000062
-M1_ofi,0.0,0.0
-M2_ofi_spread_depth,0.0,0.0
-M3_ofi_signedvol,0.10999999999999939,0.02000000000001019
-M4_ofi_intensity,0.0,0.0
-M5_full,0.0600000000000022,0.0400000000000062

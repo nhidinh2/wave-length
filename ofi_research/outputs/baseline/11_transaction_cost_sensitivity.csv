@@ -1,5 +1,0 @@
-scenario,net_pnl
-baseline_net,0.0
-plus_1_tick_slippage_net,0.0
-double_fees_net,0.0
-mid_to_mid_gross_theoretical,0.0

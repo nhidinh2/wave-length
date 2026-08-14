@@ -1,2 +1,0 @@
-n_records,n_bad_ts_recv,pct_bad_ts_recv,capture_lag_median_ms,capture_lag_p99_ms,capture_lag_negative_count,interpretation
-3652515,0,0.0,0.167011,0.17512,0,"ts_recv - ts_event is a CAPTURE/FEED-latency proxy (venue send -> Databento capture server), not network congestion and not your own receive time."

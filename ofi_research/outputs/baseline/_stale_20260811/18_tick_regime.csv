@@ -1,2 +1,0 @@
-n_obs,tick_size,median_spread_ticks,pct_at_one_tick,regime,basis,label,replication_note
-1079642,0.01,3.0,10.950018617282394,small_tick,training rows only; preregister before evaluating P&L,INTC_20d_baseline,One symbol validates the pipeline and gives an initial effect estimate; it is not a general profitability claim. A large-tick and a small-tick symbol must be run as SEPARATE preregistered replications and never pooled without interactions or stratification.

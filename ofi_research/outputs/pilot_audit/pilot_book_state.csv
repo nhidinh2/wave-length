@@ -1,2 +1,0 @@
-n_rows,n_missing_bid,n_missing_ask,n_crossed,n_locked,n_nonpositive_size,n_book_clears,n_inferred_halts,n_segments,n_long_quiet_gaps
-3425129,0,0,0,0,0,0,0,1,36

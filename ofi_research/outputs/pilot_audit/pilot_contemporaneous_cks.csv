@@ -1,6 +1,0 @@
-window_ms,n_bins,beta,r_squared,t_stat_hac,interpretation
-100.0,164569,1.0004666250523111e-05,0.5923918569101476,25.14753573259014,"CONTEMPORANEOUS sanity check only — not predictive, not tradeable"
-500.0,45856,1.0308574242411597e-05,0.639243390818544,24.440543067040355,"CONTEMPORANEOUS sanity check only — not predictive, not tradeable"
-1000.0,23264,1.0179790535274199e-05,0.6472602081095686,23.06117092169457,"CONTEMPORANEOUS sanity check only — not predictive, not tradeable"
-5000.0,4656,9.956504056785209e-06,0.6799428438484239,21.877673252208314,"CONTEMPORANEOUS sanity check only — not predictive, not tradeable"
-10000.0,2328,9.89525726374469e-06,0.692971258938653,22.114018930512916,"CONTEMPORANEOUS sanity check only — not predictive, not tradeable"

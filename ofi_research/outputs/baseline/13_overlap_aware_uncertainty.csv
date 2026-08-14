@@ -1,3 +1,0 @@
-quantity,unit,n_obs,n_days,estimate,se_day_bootstrap,ci95_low,ci95_high,frac_same_sign,statistic,mean,se_day_clustered,t_day_clustered,horizon,basis
-oos_pred_corr_M1,correlation,8,8,0.007284412354134925,0.002459312096192314,0.002486666311000354,0.011883484028087138,0.999,mean,,,,ms1000,whole trading days resampled/clustered; overlapping targets make per-row iid SEs invalid
-oos_pred_corr_M1,correlation,8,8,,,,,,,0.007284412354134925,0.0027089332753721268,2.689033510112671,ms1000,whole trading days resampled/clustered; overlapping targets make per-row iid SEs invalid
