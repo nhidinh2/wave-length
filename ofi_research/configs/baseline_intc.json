@@ -1,0 +1,23 @@
+{
+  "label": "INTC_20d_baseline",
+  "data": {
+    "price_mode": "fixed"
+  },
+  "columns": {
+    "deep_bid_price": "bid_px_{i0:02d}",
+    "deep_ask_price": "ask_px_{i0:02d}",
+    "deep_bid_size": "bid_sz_{i0:02d}",
+    "deep_ask_size": "ask_sz_{i0:02d}"
+  },
+  "sampling": {
+    "decision_interval_ms": 200.0
+  },
+  "costs": {
+    "tick_size": 0.01,
+    "latency": {
+      "capture_to_user_ms": 0.5,
+      "decode_decide_ms": 0.3,
+      "user_to_venue_ms": 0.5
+    }
+  }
+}

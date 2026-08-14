@@ -1,0 +1,2 @@
+reason,n_removed,pct_removed,identity_columns
+confirmed_ingestion_duplicate,0,0.0,"ts_recv,ts_event,sequence,action,side,price,size,flags,instrument,depth,rtype,publisher_id,instrument_id,bid_px_00,ask_px_00,bid_sz_00,ask_sz_00,bid_px_01,ask_px_01,bid_sz_01,ask_sz_01,bid_px_02,ask_px_02,bid_sz_02,ask_sz_02,bid_px_03,ask_px_03,bid_sz_03,ask_sz_03,bid_px_04,ask_px_04,bid_sz_04,ask_sz_04,bid_px_05,ask_px_05,bid_sz_05,ask_sz_05,bid_px_06,ask_px_06,bid_sz_06,ask_sz_06,bid_px_07,ask_p"
