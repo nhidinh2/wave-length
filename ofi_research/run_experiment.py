@@ -888,6 +888,22 @@ def _col(df: pd.DataFrame, name: str, how: str = "sum") -> float:
     return float(getattr(s, how)())
 
 
+def pnl_gate_evaluable(config: Config, n_trades: float,
+                       n_trade_days: int) -> bool:
+    """Is the ledger thick enough for a P&L verdict to mean anything?
+
+    Separated from :func:`write_report` so the rule can be tested without
+    building a whole run context. The three P&L criteria share one answer
+    because they share one ledger: if it is too thin to say whether the policy
+    made money, it is equally too thin to say the money was spread across days
+    or survived a cost sweep.
+    """
+    return bool(float(n_trades or 0)
+                >= int(config.evaluation.min_trades_for_pnl_gate)
+                and int(n_trade_days or 0)
+                >= int(config.evaluation.min_trade_days_for_pnl_gate))
+
+
 def _sample_accounting(config: Config, ctx: Dict) -> Dict:
     """Count folds, market dates, and trades as SEPARATE quantities.
 
@@ -1214,11 +1230,21 @@ def write_report(config: Config, ctx: Dict) -> Path:
         if len(decile) and "mean_monotonicity_spearman" in decile else np.nan
 
     acct = _sample_accounting(config, ctx)
-    traded = bool(acct["n_trades"] and acct["n_trades"] > 0)
 
     # Three-valued gate. A criterion never exercised is NOT_EVALUABLE, not FAIL:
     # scoring an empty ledger as a failure converts missing trading evidence
     # into negative trading evidence.
+    #
+    # "Exercised" is a matter of degree, not of emptiness. A ledger holding one
+    # trade supports a verdict no better than an empty one, so the P&L criteria
+    # need a minimum of trades AND of distinct trading days before they are
+    # scored at all -- see EvaluationConfig.min_trades_for_pnl_gate.
+    n_trades = float(acct["n_trades"] or 0)
+    n_trade_days = int(acct["trade_dates"] or 0)
+    min_tr = int(config.evaluation.min_trades_for_pnl_gate)
+    min_td = int(config.evaluation.min_trade_days_for_pnl_gate)
+    traded = bool(n_trades > 0)
+    pnl_evaluable = pnl_gate_evaluable(config, n_trades, n_trade_days)
     PASS, FAIL, NA = "PASS", "FAIL", "NOT_EVALUABLE"
 
     def gate(ok: bool, evaluable: bool = True) -> str:
@@ -1235,13 +1261,13 @@ def write_report(config: Config, ctx: Dict) -> Path:
         "sensible_deciles": gate((not np.isnan(mono)) and mono > 0.5,
                                  not np.isnan(mono)),
         "net_positive": gate(
-            (not np.isnan(net_total)) and net_total > 0, traded),
+            (not np.isnan(net_total)) and net_total > 0, pnl_evaluable),
         "not_one_day": gate(
             (not np.isnan(conc.get("max_day_share", np.nan)))
-            and conc["max_day_share"] < 0.6, traded),
+            and conc["max_day_share"] < 0.6, pnl_evaluable),
         "survives_stress": gate(
             bool((lat_t["net_pnl"] > 0).all())
-            and bool((cost_t["net_pnl"] >= 0).any()), traded),
+            and bool((cost_t["net_pnl"] >= 0).any()), pnl_evaluable),
     }
 
     # The strategy question moved to the maker path, so the gate follows it.
@@ -1320,12 +1346,32 @@ def write_report(config: Config, ctx: Dict) -> Path:
                    "directly tradable under the tested aggressive-execution "
                    "assumptions.")
     elif proceed:
-        verdict = ("OFI shows out-of-sample predictive structure that survives "
-                   "the tested costs and stress checks. Proceed to the "
-                   "response-kernel stage.")
+        # Only claim cost/stress survival when those criteria were scored.
+        # With the taker path off or the ledger too thin they are
+        # NOT_EVALUABLE, and `proceed` then rests on the predictive and
+        # passive criteria alone -- which is a different, weaker sentence.
+        _survived = checks["survives_stress"] == PASS
+        verdict = ("OFI shows out-of-sample predictive structure that "
+                   + ("survives the tested costs and stress checks. "
+                      if _survived else
+                      "clears every criterion this run was able to evaluate "
+                      f"(not evaluable: {', '.join(unevaluated)}). ")
+                   + "Proceed to the response-kernel stage.")
     else:
-        verdict = ("OFI is predictive and net-positive out of sample, but the "
-                   "decision gate is NOT fully met (failing: "
+        # Only claim net-positive when the P&L criteria were actually scored.
+        # Asserting it off an unscored ledger is how a single winning trade
+        # once became a headline finding.
+        if checks["net_positive"] == PASS:
+            _lead = "OFI is predictive and net-positive out of sample"
+        elif traded:
+            _lead = ("OFI is predictive out of sample; the ledger holds "
+                     f"{_fmt(acct['n_trades'],0)} trade(s) over "
+                     f"{acct['trade_dates']} day(s), too few to support any "
+                     "P&L claim in either direction")
+        else:
+            _lead = ("OFI is predictive out of sample; tradability was never "
+                     "exercised")
+        verdict = (_lead + ", and the decision gate is NOT fully met (failing: "
                    + (", ".join(failed) or "none")
                    + ("; not evaluable: " + ", ".join(unevaluated)
                       if unevaluated else "")
@@ -1359,6 +1405,12 @@ def write_report(config: Config, ctx: Dict) -> Path:
     lines.append("\n### Decision-gate checklist\n")
     lines.append("| Criterion | Status | Basis |\n|---|---|---|")
     icon = {PASS: "✅ PASS", FAIL: "❌ FAIL", NA: "⬜ NOT_EVALUABLE"}
+    # Traded, but too thinly for the result to mean anything. Distinguished
+    # from "never traded" because the two invite different next steps: one
+    # says the policy is inert, the other that the sample is too small.
+    _thin = (f"{_fmt(acct['n_trades'],0)} trade(s) over {acct['trade_dates']} "
+             f"day(s) — below the {min_tr}-trade / {min_td}-day minimum for a "
+             f"P&L verdict (evaluation.min_trades_for_pnl_gate)")
     basis = {
         "stable_coef_sign": f"beta_1 positive in {_fmt(pct_pos_beta,1)}% of "
                             f"{acct['oos_folds']} folds",
@@ -1366,11 +1418,15 @@ def write_report(config: Config, ctx: Dict) -> Path:
                             f"{_fmt(pct_pos_corr,1)}% of folds",
         "sensible_deciles": f"decile Spearman {_fmt(mono,3)}",
         "net_positive": (f"{_fmt(acct['n_trades'],0)} trades executed"
+                         if pnl_evaluable else _thin
                          if traded else "no trades executed — never tested"),
         "not_one_day": (f"largest day = {_fmt(conc.get('max_day_share'),3)} of "
                         f"total |P&L| over {acct['trade_dates']} day(s)"
+                        if pnl_evaluable else _thin
                         if traded else "no trading days to concentrate in"),
-        "survives_stress": ("latency/cost sweeps" if traded else
+        "survives_stress": ("latency/cost sweeps"
+                            if pnl_evaluable else _thin
+                            if traded else
                             "stress sweeps ran on a policy that never traded"),
     }
     if taker_off:

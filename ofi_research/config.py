@@ -390,6 +390,23 @@ class EvaluationConfig:
     #: feature change could plausibly overturn the taker verdict.
     run_taker_backtest: bool = False
 
+    #: Trades the ledger needs before the P&L criteria (``net_positive``,
+    #: ``not_one_day``, ``survives_stress``) may read PASS or FAIL rather than
+    #: NOT_EVALUABLE. A ledger of one trade is an anecdote: the 20-day M5 run
+    #: executed a single trade, won 4 ticks on it, and the gate duly reported
+    #: "net-positive out of sample" beside a concentration FAIL saying that all
+    #: of the P&L came from one day. Both statements were about the same trade.
+    #: Zero restores the old behaviour, where any non-empty ledger is scored.
+    min_trades_for_pnl_gate: int = 30
+
+    #: Distinct trading days the ledger must span before those same criteria
+    #: are scored. Overlapping targets make rows within a day dependent, so
+    #: every interval in the report is day-blocked; a one-day ledger therefore
+    #: carries one effective observation no matter how many trades it holds.
+    #: ``not_one_day`` in particular cannot discriminate below two days — it
+    #: reads 1.000 by construction, which is arithmetic rather than evidence.
+    min_trade_days_for_pnl_gate: int = 2
+
 
 # --- Passive (maker) evaluation ---
 @dataclass
