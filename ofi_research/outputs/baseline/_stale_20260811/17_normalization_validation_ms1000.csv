@@ -1,0 +1,5 @@
+model,val_corr,val_r2,val_dir_acc,n_folds,selected_on
+N_z_shifted,0.008113690426110083,-4.736272530957153e-05,0.5010427590995924,8,validation folds only; test fold not consulted
+N_z_inclusive,0.008100046331526558,-5.140597165807781e-05,0.501028535460588,8,validation folds only; test fold not consulted
+N_trailing_depth,0.007673135189832838,-3.519277999367021e-06,0.4979935251125663,8,validation folds only; test fold not consulted
+N_current_depth,0.004111105060226631,-1.803279389663015e-05,0.4971264528725283,8,validation folds only; test fold not consulted
