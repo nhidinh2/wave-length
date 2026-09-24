@@ -11,3 +11,7 @@ passive_tapes/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Raw market data (~4.7 GB) is kept locally, not in git: files exceed
+# GitHub's 100 MB limit.
+data/
