@@ -82,7 +82,7 @@ def test_queue_measured_on_arrival_not_decision():
 # --- price changes end the episode -------------------------------------
 def test_price_change_starts_a_new_queue():
     """Our place in line does not survive the level moving."""
-    b = _book(6, bid_sz=100.0, vols=[0, 60, 0, 60, 0, 0])
+    b = _book(6, bid_sz=100.0, vols=[0, 60, 0, 0, 60, 0])
     b["px"] = np.array([10.0, 10.0, 10.0, 10.01, 10.01, 10.01])
     out = _sim(b, alpha=1.0)
     # 60 before the move plus 60 after would clear 100 in a single queue.
@@ -90,6 +90,30 @@ def test_price_change_starts_a_new_queue():
     assert out["fill_idx"].size == 0
     starts, ends = _episode_bounds(b["px"], b["seg"])
     assert starts.tolist() == [0, 3] and ends.tolist() == [2, 5]
+
+
+def test_level_clearing_print_fills_at_the_level_it_cleared():
+    """A row carries the book AFTER its event, so a print that sweeps the bid
+    arrives on a row whose bid has already dropped. It traded at the OLD bid.
+
+    Reading it against its own row credited the fill to 9.99 — a tick better
+    than it printed — or, when the price change ended the episode first,
+    dropped it entirely. Those are the most adverse fills in the book.
+    """
+    b = _book(5, bid_sz=100.0, vols=[0, 0, 150, 0, 0])
+    b["px"] = np.array([10.0, 10.0, 9.99, 9.99, 9.99])
+    b["sz"] = np.array([100.0, 100.0, 80.0, 80.0, 80.0])
+    for alpha in (0.0, 1.0):          # 150 clears all 100 ahead either way
+        out = _sim(b, alpha=alpha)
+        assert out["fill_idx"].tolist() == [2]     # the print's own row/time
+        assert out["fill_price"].tolist() == [10.0]
+
+
+def test_print_on_the_join_row_predates_us():
+    """Volume on the row we arrive at traded against the book BEFORE it."""
+    b = _book(4, vols=[0, 0, 50, 0])
+    b["gate"] = np.array([False, False, True, True])
+    assert _sim(b, alpha=0.0)["fill_idx"].size == 0
 
 
 def test_segment_break_starts_a_new_queue():
@@ -194,3 +218,113 @@ def test_passive_config_round_trips_through_json():
     assert cfg.passive.queue_ahead_fractions == [0.0, 0.75]
     assert cfg.passive.rebate_sweep == [0.0, 0.002]
     assert cfg.evaluation.run_taker_backtest is False
+
+
+# --- unwinding the inventory -------------------------------------------
+from ofi_research.passive_policy import (_bonferroni_t, policy_gate,  # noqa: E402
+                                         precompute_side, simulate_unwind)
+
+
+def _unwind(ask, buys, bid, seg=None, alpha=0.0, fill_row=0,
+            timeouts=(3.0,), lat_ns=0):
+    """A long filled at 10.00 on ``fill_row``; unwind it on the ask."""
+    n = len(ask)
+    ts = np.arange(n, dtype=np.int64) * 1_000_000          # 1 ms per row
+    seg = np.zeros(n, dtype=np.int64) if seg is None else np.asarray(seg)
+    ask = np.asarray(ask, dtype=np.float64)
+    sz = np.full(n, 100.0)
+    pre = precompute_side(ask, sz, np.asarray(buys, dtype=np.float64), seg)
+    return simulate_unwind(ts, seg, np.array([fill_row]), np.array([10.00]),
+                           1, ask, sz, np.asarray(bid, dtype=np.float64), pre,
+                           alpha, lat_ns, list(timeouts))
+
+
+def test_passive_exit_earns_the_spread():
+    out = _unwind(ask=[10.02] * 5, buys=[0, 0, 30, 0, 0], bid=[10.00] * 5)
+    assert out["passive_3"].tolist() == [True]
+    assert out["pnl_3"][0] == pytest.approx(0.02)
+
+
+def test_unfilled_exit_crosses_at_the_deadline():
+    """No buyer arrives: sell at the bid standing when the timeout bites."""
+    out = _unwind(ask=[10.02] * 6, buys=[0] * 6,
+                  bid=[10.00, 10.00, 10.00, 9.98, 9.98, 9.98])
+    assert out["passive_3"].tolist() == [False]
+    assert out["pnl_3"][0] == pytest.approx(-0.02)
+
+
+def test_shorter_timeout_crosses_what_a_longer_one_rests_out():
+    out = _unwind(ask=[10.02] * 6, buys=[0, 0, 0, 0, 30, 0],
+                  bid=[10.00, 10.00, 9.99, 9.99, 9.99, 9.99],
+                  timeouts=(2.0, 5.0))
+    assert out["passive_2"].tolist() == [False]
+    assert out["pnl_2"][0] == pytest.approx(-0.01)
+    assert out["passive_5"].tolist() == [True]
+    assert out["pnl_5"][0] == pytest.approx(0.02)
+
+
+def test_exit_repegs_when_the_ask_moves():
+    """The ask drops a tick; the exit follows it and fills there."""
+    out = _unwind(ask=[10.02, 10.02, 10.01, 10.01, 10.01],
+                  buys=[0, 0, 0, 30, 0], bid=[10.00] * 5)
+    assert out["passive_3"].tolist() == [True]
+    assert out["pnl_3"][0] == pytest.approx(0.01)
+
+
+def test_exit_behind_the_queue_waits_for_it():
+    """At alpha=1 the 100 displayed ahead must trade first."""
+    out = _unwind(ask=[10.02] * 6, buys=[0, 60, 0, 0, 60, 0],
+                  bid=[10.00] * 6, alpha=1.0, timeouts=(2.0, 5.0))
+    assert out["passive_2"].tolist() == [False]    # only 60 by the deadline
+    assert out["passive_5"].tolist() == [True]     # 120 > 100 by row 4
+
+
+def test_exit_that_leaves_the_segment_is_dropped():
+    out = _unwind(ask=[10.02] * 4, buys=[0] * 4, bid=[10.00] * 4,
+                  seg=[0, 0, 1, 1])
+    assert np.isnan(out["pnl_3"][0])
+
+
+# --- the gate reads significance, not the biggest number ---------------
+def test_bonferroni_is_stricter_than_two():
+    # 20 cells, 8 days: far above the naive 2.0.
+    assert _bonferroni_t(20, 8, 0.05) > 4.0
+    assert _bonferroni_t(1, 8, 0.05) == pytest.approx(2.365, abs=1e-3)
+
+
+def _grid_cell(gq, alpha, mk, t, unwind, unwind_t, n_fills=5000):
+    return {"gate_quantile": gq, "queue_ahead_fraction": alpha,
+            "maker_rebate_per_unit": 0.0, "markout_ticks": mk, "t_stat": t,
+            "n_fills": n_fills, "n_days": 8, "below_min_fills": False,
+            "markout_after_crossing_out_ticks": mk - 1.2,
+            "unwind_1000ms_ticks": unwind, "unwind_1000ms_t": unwind_t,
+            "unwind_1000ms_passive_exit_frac": 0.4}
+
+
+def _gate(rows):
+    cfg = Config()
+    cfg.passive.unwind_timeouts_ms = [1000.0]
+    return policy_gate(pd.DataFrame(rows), cfg).set_index("criterion")
+
+
+def test_back_of_queue_cannot_pass_on_a_noisy_cell():
+    """The last real run passed this on t = 0.75. It must not."""
+    g = _gate([_grid_cell(0.0, 1.0, 0.19, 3.2, -0.5, -3.0),
+               _grid_cell(0.9, 1.0, 0.25, 0.75, -0.4, -1.0),
+               _grid_cell(0.3, 0.0, 0.27, 7.8, -0.3, -2.0)])
+    assert g.loc["survives_back_of_queue", "status"] == "FAIL"
+
+
+def test_positive_markout_with_a_losing_exit_fails_the_verdict():
+    """Free exit at mid is not an exit."""
+    g = _gate([_grid_cell(0.3, 0.0, 0.27, 7.8, -0.98, -9.0)])
+    assert g.loc["markout_positive_significant", "status"] == "PASS"
+    assert g.loc["positive_after_exit_costs", "status"] == "FAIL"
+    assert g.loc["rebate_not_load_bearing", "status"] == "FAIL"
+    # And the basis states the bracket, not one end of it.
+    assert "Bracket" in g.loc["positive_after_exit_costs", "basis"]
+
+
+def test_filter_comparison_without_days_is_not_evaluable():
+    g = _gate([_grid_cell(0.3, 0.0, 0.27, 7.8, 0.1, 1.0)])
+    assert g.loc["filter_beats_unconditional", "status"] == "NOT_EVALUABLE"

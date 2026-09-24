@@ -15,3 +15,9 @@ __pycache__/
 # Raw market data (~4.7 GB) is kept locally, not in git: files exceed
 # GitHub's 100 MB limit.
 data/
+
+# Cached sampled feature frame (~GBs), regenerable with `run`.
+features.parquet
+features_notes.json
+# Detached run logs.
+run.log

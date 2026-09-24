@@ -129,3 +129,18 @@ def test_missing_tape_is_survivable(prepared, tmp_path):
     out = run_passive_walk_forward(feat, cfg, "ms1000", model_name="M1_ofi")
     # 13 days gives exactly one fold, whose test day we just deleted.
     assert out == {}
+
+
+def test_unwind_gate_and_report_render_end_to_end(prepared):
+    """The unwind columns reach the grid, and the gate and report read them."""
+    from ofi_research.passive_policy import policy_gate, policy_report_section
+    cfg, feat = prepared
+    out = run_passive_walk_forward(feat, cfg, "ms1000", model_name="M1_ofi")
+    grid, daily = out["23_passive_policy_grid"], out["24_passive_policy_by_day"]
+    for k in (1000, 5000):
+        assert f"unwind_{k}ms_ticks" in grid.columns
+        assert f"mean_unwind_{k}" in daily.columns
+    gate = policy_gate(grid, cfg, daily)
+    assert "positive_after_exit_costs" in set(gate["criterion"])
+    text = policy_report_section(out, cfg)
+    assert "What does getting out cost?" in text

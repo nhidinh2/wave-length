@@ -16,7 +16,7 @@ The OFI increment implements exactly the section-6 event definition. See
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -268,6 +268,88 @@ def _rolling_time_sum(df: pd.DataFrame, values: pd.Series, window_ms: float
     return out
 
 
+def _causal_kernel_filter(t_ns: np.ndarray, seg: np.ndarray,
+                          values: np.ndarray, tau_ms: float,
+                          period_ms: Optional[float] = None,
+                          chunk_taus: float = 20.0) -> np.ndarray:
+    """``z_k = Σ_{j<=k, same segment} exp(-λ (t_k - t_j)) · f_j``, exactly.
+
+    ``λ = 1/tau - iω`` with ``ω = 2π/period`` (0 when ``period_ms`` is None),
+    so the real part is the exponential/cosine kernel and the imaginary part
+    the damped sine. Time is continuous — two events 1 µs apart barely decay,
+    two events a second apart decay by exp(-1 s/tau) — and the sum resets at
+    every segment boundary, like the rolling helpers above.
+
+    Evaluated as scaled cumulative sums over chunks no longer than
+    ``chunk_taus`` time constants, so the exp(+λt) factor never exceeds
+    e^chunk_taus; the state carries across chunks by one decay factor. Row
+    ``k`` reads rows ``<= k`` only, which the truncation test pins.
+    """
+    n = len(values)
+    out = np.zeros(n, dtype=np.complex128)
+    if n == 0:
+        return out
+    tau_s = tau_ms / 1000.0
+    omega = 0.0 if not period_ms else 2.0 * np.pi / (period_ms / 1000.0)
+    lam = complex(1.0 / tau_s, -omega)
+    f = np.nan_to_num(values.astype(np.float64), nan=0.0)
+    new_seg = np.flatnonzero(np.concatenate(([True], seg[1:] != seg[:-1])))
+    seg_end = np.append(new_seg[1:], n)
+    for s0, s1 in zip(new_seg, seg_end):
+        t = (t_ns[s0:s1] - t_ns[s0]).astype(np.float64) / 1e9
+        chunk = np.floor(t / (chunk_taus * tau_s)).astype(np.int64)
+        bounds = np.flatnonzero(np.concatenate(([True],
+                                                chunk[1:] != chunk[:-1])))
+        bounds = np.append(bounds, s1 - s0)
+        z_prev, t_prev = 0.0 + 0.0j, None
+        for c0, c1 in zip(bounds[:-1], bounds[1:]):
+            tc = t[c0:c1]
+            a = tc[0]
+            carry = (0.0 + 0.0j if t_prev is None
+                     else z_prev * np.exp(-lam * (a - t_prev)))
+            acc = carry + np.cumsum(np.exp(lam * (tc - a)) * f[s0 + c0:s0 + c1])
+            z = np.exp(-lam * (tc - a)) * acc
+            out[s0 + c0:s0 + c1] = z
+            z_prev, t_prev = z[-1], tc[-1]
+    return out
+
+
+def add_wave_features(df: pd.DataFrame, config: Config) -> pd.DataFrame:
+    """The wave / Duhamel layer ``u_t``: OFI pushed through a kernel basis.
+
+    One column per exponential kernel (``wave_exp{tau}``) and a sin/cos pair
+    per oscillatory one (``wave_osc{tau}p{period}_sin|cos``). Linear models
+    combine them with train-fitted weights, which is the kernel estimate.
+    """
+    t_ns = df["timestamp"].astype("int64").to_numpy()
+    seg = df["segment_id"].to_numpy()
+    f = df["OFI_level_1_increment"].to_numpy(dtype=np.float64)
+    for k in config.features.wave_kernels:
+        tau = float(k["tau_ms"])
+        per = k.get("period_ms")
+        z = _causal_kernel_filter(t_ns, seg, f, tau, per)
+        if per:
+            name = f"wave_osc{int(tau)}p{int(per)}"
+            df[f"{name}_sin"] = z.imag
+            df[f"{name}_cos"] = z.real
+        else:
+            df[f"wave_exp{int(tau)}"] = z.real
+    return df
+
+
+def wave_feature_names(config: Config) -> List[str]:
+    """Column names :func:`add_wave_features` produces, in order."""
+    names: List[str] = []
+    for k in config.features.wave_kernels:
+        tau, per = int(k["tau_ms"]), k.get("period_ms")
+        if per:
+            names += [f"wave_osc{tau}p{int(per)}_sin",
+                      f"wave_osc{tau}p{int(per)}_cos"]
+        else:
+            names.append(f"wave_exp{tau}")
+    return names
+
+
 def _rolling_time_count(df: pd.DataFrame, indicator: pd.Series,
                         window_ms: float) -> pd.Series:
     return _rolling_time_sum(df, indicator.astype(float), window_ms)
@@ -432,6 +514,9 @@ def build_features(df: pd.DataFrame, config: Config
             df[f"{tag}_ev{w}"] = _rolling_event_sum(df, df[col], w)
         for wm in config.features.time_windows_ms:
             df[f"{tag}_ms{int(wm)}"] = _rolling_time_sum(df, df[col], wm)
+
+    # the wave / Duhamel layer u_t (stage 2)
+    df = add_wave_features(df, config)
 
     # how much CLOCK time each event-count window actually spans (P0.3)
     max_age = config.integrity.max_event_window_age_ms

@@ -145,7 +145,7 @@ def required_columns(df: pd.DataFrame, config: Config) -> Set[str]:
     # horizon/window realization table reports (P0.3 — an event window is not a
     # fixed amount of clock time, and that has to stay visible).
     for c in df.columns:
-        if (c.startswith(("OFI", "nOFI", "zOFI", "signedvol", "regime_",
+        if (c.startswith(("OFI", "nOFI", "zOFI", "signedvol", "regime_", "wave_",
                           "trailing_", "event_window_elapsed_ms"))
                 or c in ("depth_imbalance_L1", "delta_spread",
                          "total_L1_depth", "total_L2_depth",

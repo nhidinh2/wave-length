@@ -1,0 +1,6 @@
+criterion,status,basis
+markout_positive_significant,FAIL,"best of 16 gated cells by t: q=0.90, queue 1.00x, -0.2664 ticks, t = -2.36 vs Bonferroni 4.41 (8 days). Assumes free exit at mid"
+filter_beats_unconditional,FAIL,"best of 16 gated-minus-ungated day-paired differences: q=0.50 at queue 0.00x, +0.0285 ticks, t = 4.01 vs Bonferroni 4.41"
+survives_back_of_queue,FAIL,"best of 4 cells behind all displayed depth: q=0.90, -0.2664 ticks on 3692 fills, t = -2.36 vs Bonferroni 3.34"
+positive_after_exit_costs,FAIL,"best of 32 (gate, queue, timeout) cells by t: q=0.90, queue 1.00x, 5000 ms timeout: -0.8106 ticks per round trip, t = -5.43 vs Bonferroni 5.00; 60% of exits passive. Bracket for this cell: [-1.4778 crossing every exit, -0.2664 free exit at mid]"
+rebate_not_load_bearing,FAIL,"break-even needs +0.505 ticks of rebate per share (+0.00505) on the best round trip, counting the rebate on the entry and on the 60% of passive exits; a typical US add tier is 0.20-0.30 ticks"

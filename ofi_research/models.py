@@ -31,6 +31,7 @@ except Exception:  # pragma: no cover
 
 from .config import Config
 from .diagnostics import hac_lag_rule
+from .features import wave_feature_names
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ def feature_groups(config: Config) -> Dict[str, List[str]]:
         "signed_volume": [f"signedvol_ev{ref}"],
         "intensity": ["aggressive_trade_intensity_imbalance"],
         "volatility": ["trailing_mid_vol"],
+        # u_t: OFI through the Duhamel kernel basis; weights fitted per fold.
+        "wave": wave_feature_names(config),
     }
 
 
@@ -79,6 +82,10 @@ def model_feature_sets(config: Config) -> Dict[str, List[str]]:
         "M4_ofi_intensity": ofi + g["intensity"],
         "M5_full": (ofi + g["spread"] + g["depth"] + signedvol
                     + g["intensity"] + g["volatility"]),
+        # Stage 2: the reference model plus u_t, and nothing else, so any
+        # change is attributable to the wave group alone.
+        "M6_wave": (ofi + g["spread"] + g["depth"] + signedvol
+                    + g["intensity"] + g["volatility"] + g["wave"]),
 
         # ---- L2 comparison (fixed weights are DESIGN CHOICES, not CKS) ----
         "L2_ofi1_only": list(ofi),
@@ -117,7 +124,7 @@ def model_feature_sets(config: Config) -> Dict[str, List[str]]:
 #: The attributable ladder, in the order it should be reported.
 LADDER_ORDER = ["M0_constant", "M1_ofi", "M1N_ofi_normalized",
                 "M2_ofi_spread_depth", "M3_ofi_signedvol",
-                "M4_ofi_intensity", "M5_full"]
+                "M4_ofi_intensity", "M5_full", "M6_wave"]
 
 #: Leave-one-group-out models, reported against ``M5_full``.
 LOGO_ORDER = ["LOGO_minus_ofi", "LOGO_minus_spread", "LOGO_minus_depth",

@@ -282,6 +282,21 @@ class FeatureConfig:
     # trade classification when trade_side missing
     trade_classifier: str = "lee_ready"  # 'quote' | 'tick' | 'lee_ready'
 
+    #: Duhamel response basis for the wave layer ``u_t`` (stage 2). Each entry
+    #: convolves the level-1 OFI increments with a causal continuous-time
+    #: kernel over the segment's past: ``exp(-dt/tau)`` when ``period_ms`` is
+    #: absent, else the damped-oscillator pair ``exp(-dt/tau)·sin/cos(2π
+    #: dt/period)`` — the Green's function of u'' + 2γu' + ω²u = OFI. The
+    #: kernel G itself is ``Σ w_k φ_k``, with the weights w fitted by the
+    #: walk-forward model on TRAIN days only. The timescales bracket the
+    #: stage-1 impulse response (half-life ~400 ms, dead beyond ~5 s); they
+    #: were read off the pooled table 03, a mild hyperparameter peek that is
+    #: disclosed rather than hidden.
+    wave_kernels: List[Dict[str, float]] = field(default_factory=lambda: [
+        {"tau_ms": 100.0}, {"tau_ms": 400.0}, {"tau_ms": 1600.0},
+        {"tau_ms": 1000.0, "period_ms": 2000.0},
+    ])
+
     tick_size: float = 0.01
 
 
@@ -407,6 +422,18 @@ class EvaluationConfig:
     #: reads 1.000 by construction, which is arithmetic rather than evidence.
     min_trade_days_for_pnl_gate: int = 2
 
+    #: Horizons at which ``M6_wave`` is scored against ``M5_full``. Stage 1's
+    #: impulse response peaks at 100 ms and has a ~400 ms half-life, so the
+    #: 1 s primary horizon alone would test the tail of the response rather
+    #: than its body.
+    wave_horizons: List[str] = field(
+        default_factory=lambda: ["ms100", "ms250", "ms500", "ms1000"])
+
+    #: Write the sampled decision frame to ``features.parquet`` after prep,
+    #: so a later run can load it with ``--features`` instead of spending
+    #: ~4.5 h rebuilding it. Gitignored: it is a regenerable cache.
+    save_feature_frame: bool = True
+
 
 # --- Passive (maker) evaluation ---
 @dataclass
@@ -470,6 +497,25 @@ class PassiveConfig:
     #: reported. Selective gates at deep queue positions can fill so rarely
     #: that the mean is one day's noise.
     min_fills_per_cell: int = 200
+
+    #: How long a fill's inventory may rest on a passive exit before it is
+    #: flattened by crossing the spread. After each fill we peg an order at the
+    #: OPPOSITE touch (a long fill rests an ask), joining that queue at the same
+    #: ``queue_ahead_fraction`` as the entry and re-pegging whenever the touch
+    #: moves. ``markout`` alone assumes free liquidation at mid and
+    #: ``markout_after_crossing_out`` assumes crossing on every fill; this
+    #: simulates where between the two the business actually lands. Each fill
+    #: is unwound independently — there is no inventory limit and no netting
+    #: of a long fill against a later short one.
+    unwind_timeouts_ms: List[float] = field(
+        default_factory=lambda: [1000.0, 5000.0])
+
+    #: Family-wise error rate for the passive gate. Every criterion picks the
+    #: best of many (gate, queue, timeout) cells, so each is tested against a
+    #: Bonferroni-adjusted day-clustered t critical value over the cells it
+    #: searched, not against 2.0. The last run passed ``survives_back_of_queue``
+    #: on a t = 0.75 cell chosen as the largest of 100 point estimates.
+    gate_family_alpha: float = 0.05
 
 
 # --- Memory footprint / decision clock ---

@@ -21,6 +21,9 @@ FEATURE_COLS = [
     "nOFI_L1", "nOFI_L2", "zOFI", "trailing_mid_vol",
     "spread", "delta_spread", "depth_imbalance_L1",
     "market_order_intensity_imbalance",
+    # the wave layer u_t: a convolution over the past must not see the future
+    "wave_exp100", "wave_exp400", "wave_exp1600",
+    "wave_osc1000p2000_sin", "wave_osc1000p2000_cos",
 ]
 
 

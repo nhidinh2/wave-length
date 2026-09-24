@@ -18,6 +18,7 @@ never by in-sample p-values.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from dataclasses import asdict, replace
@@ -1283,7 +1284,8 @@ def write_report(config: Config, ctx: Dict) -> Path:
     if pgate is not None and len(pgate):
         for _, r in pgate.iterrows():
             checks[f"passive_{r['criterion']}"] = (
-                PASS if r["status"] == "PASS" else FAIL)
+                PASS if r["status"] == "PASS"
+                else NA if r["status"] == "NOT_EVALUABLE" else FAIL)
 
     # A gate made only of NOT_EVALUABLE rows is not a pass. Proceeding
     # requires at least one criterion that was actually exercised.
@@ -1454,6 +1456,7 @@ def write_report(config: Config, ctx: Dict) -> Path:
     polt = ctx.get("policy_tables") or {}
     if polt:
         lines.append(passive_policy.policy_report_section(polt, config))
+    lines.append(_wave_report_section(ctx.get("wave_table")))
 
     lines.append("\n## Answers to the section-29 questions\n")
     qa = [
@@ -1583,6 +1586,86 @@ def run_phase0_screen(feat: pd.DataFrame, config: Config,
         return {}
 
 
+def wave_comparison(feat: pd.DataFrame, config: Config, primary: str,
+                    fold_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Stage 2: does u_t add to the baseline, and at which horizons?
+
+    ``M6_wave`` is ``M5_full`` plus the wave group and nothing else, fitted
+    on the same folds, so a per-fold difference is attributable to u_t. Each
+    fold tests one day, so the interval resamples FOLDS (= days) — with eight
+    of them it will be wide, and that width is the result.
+    """
+    base, wave = config.evaluation.reference_model, "M6_wave"
+    rows = []
+    for tag in config.evaluation.wave_horizons:
+        if f"future_mid_change_{tag}" not in feat.columns:
+            continue
+        if tag == primary and fold_metrics is not None and len(fold_metrics):
+            fm = fold_metrics
+        else:
+            try:
+                fm, _, _ = walk_forward(feat, config, tag,
+                                        model_names=[base, wave],
+                                        table_tag=f"{tag}_wave",
+                                        ledger_model=base)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Wave comparison at %s failed", tag)
+                continue
+        p = fm[fm["model"].isin([base, wave])].pivot_table(
+            index="fold", columns="model", values=["oos_corr", "oos_r2"])
+        if p.empty or wave not in p["oos_corr"].columns:
+            continue
+        d_corr = (p["oos_corr"][wave] - p["oos_corr"][base]).dropna()
+        d_r2 = (p["oos_r2"][wave] - p["oos_r2"][base]).dropna()
+        rng = np.random.default_rng(config.evaluation.bootstrap_seed)
+        n = d_corr.size
+        boot = (rng.choice(d_corr.to_numpy(), size=(
+            config.evaluation.n_day_bootstrap, n)).mean(axis=1)
+            if n else np.array([np.nan]))
+        rows.append({
+            "horizon": tag, "n_folds": n,
+            "base_oos_corr": float(p["oos_corr"][base].mean()),
+            "wave_oos_corr": float(p["oos_corr"][wave].mean()),
+            "delta_oos_corr": float(d_corr.mean()),
+            "delta_corr_ci_lo": float(np.nanpercentile(boot, 2.5)),
+            "delta_corr_ci_hi": float(np.nanpercentile(boot, 97.5)),
+            "folds_delta_corr_positive": int((d_corr > 0).sum()),
+            "base_oos_r2": float(p["oos_r2"][base].mean()),
+            "wave_oos_r2": float(p["oos_r2"][wave].mean()),
+            "delta_oos_r2": float(d_r2.mean()),
+            "folds_delta_r2_positive": int((d_r2 > 0).sum()),
+        })
+    out = pd.DataFrame(rows)
+    if len(out):
+        _save_table(out, config, "26_wave_vs_baseline")
+    return out
+
+
+def _wave_report_section(tab: Optional[pd.DataFrame]) -> str:
+    """Stage 2 verdict: a predictive claim only, never a P&L one."""
+    if tab is None or tab.empty:
+        return ""
+    lines = ["\n## Stage 2 — does the wave layer u_t add to M5_full?\n",
+             "\n`M6_wave` = `M5_full` + OFI convolved with the Duhamel kernel "
+             "basis (`features.wave_kernels`), weights fitted on train days "
+             "only. Interval: day-bootstrap over folds.\n\n",
+             "| horizon | M5 corr | M6 corr | Δcorr | 95% CI | folds Δ>0 | "
+             "ΔR² | folds ΔR²>0 |\n|---|---|---|---|---|---|---|---|\n"]
+    for _, r in tab.iterrows():
+        lines.append(
+            f"| {r['horizon']} | {r['base_oos_corr']:.5f} | "
+            f"{r['wave_oos_corr']:.5f} | **{r['delta_oos_corr']:+.5f}** | "
+            f"[{r['delta_corr_ci_lo']:+.5f}, {r['delta_corr_ci_hi']:+.5f}] | "
+            f"{int(r['folds_delta_corr_positive'])}/{int(r['n_folds'])} | "
+            f"{r['delta_oos_r2']:+.6f} | "
+            f"{int(r['folds_delta_r2_positive'])}/{int(r['n_folds'])} |\n")
+    lines.append(
+        "\nA positive Δ is a PREDICTIVE improvement. It is not evidence that "
+        "anything trades: the taker path is dead by two orders of magnitude, "
+        "and the maker path's question is exit costs, not forecast skill.\n")
+    return "".join(lines)
+
+
 def run_passive_policy(feat: pd.DataFrame, config: Config,
                        primary: str) -> Dict[str, pd.DataFrame]:
     """Walk-forward passive quoting (see :mod:`passive_policy`).
@@ -1625,13 +1708,56 @@ def warn_if_latency_unconfigured(config: Config) -> Optional[str]:
     return msg
 
 
+FEATURE_CACHE = "features.parquet"
+FEATURE_NOTES = "features_notes.json"
+
+
+def save_feature_frame(feat: pd.DataFrame, info: Dict, config: Config) -> None:
+    """Keep the sampled frame so the next run can skip ~4.5 h of prep.
+
+    A cache, never an input the pipeline depends on: a failure is logged and
+    the run carries on.
+    """
+    od = _outdir(config)
+    try:
+        feat.to_parquet(od / FEATURE_CACHE, index=False)
+        (od / FEATURE_NOTES).write_text(
+            json.dumps(list(info.get("feature_notes") or [])))
+        logger.info("Feature frame cached -> %s (%.2f GB)", od / FEATURE_CACHE,
+                    (od / FEATURE_CACHE).stat().st_size / 1e9)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Could not cache the feature frame; continuing")
+
+
+def load_feature_frame(path: str) -> Tuple[pd.DataFrame, Dict]:
+    """Read a frame written by :func:`save_feature_frame`.
+
+    The passive study still reads event tapes from the CURRENT output
+    directory, so point ``--output`` at the run that wrote them (or copy its
+    ``passive_tapes/``) or that study is skipped.
+    """
+    p = Path(path)
+    feat = pd.read_parquet(p)
+    notes_p = p.with_name(FEATURE_NOTES)
+    notes = json.loads(notes_p.read_text()) if notes_p.exists() else []
+    logger.info("Loaded cached feature frame %s: %d rows x %d cols", p,
+                len(feat), feat.shape[1])
+    return feat, {"feature_notes": notes}
+
+
 def run_full(config: Config, df_raw: Optional[pd.DataFrame] = None,
-             stream_paths: Optional[List[str]] = None) -> Path:
+             stream_paths: Optional[List[str]] = None,
+             features_path: Optional[str] = None) -> Path:
     warn_if_latency_unconfigured(config)
-    if stream_paths:
-        feat, info = prepare_streaming(config, stream_paths)
+    if features_path:
+        feat, info = load_feature_frame(features_path)
     else:
-        feat, info = prepare(config, df_raw)
+        if stream_paths:
+            feat, info = prepare_streaming(config, stream_paths)
+        else:
+            feat, info = prepare(config, df_raw)
+        if config.evaluation.save_feature_frame:
+            save_feature_frame(feat, info, config)
 
     # Pick a primary clock horizon by a fixed, OUTCOME-INDEPENDENT rule:
     # among clock horizons with enough usable targets, prefer the smallest that
@@ -1668,6 +1794,7 @@ def run_full(config: Config, df_raw: Optional[pd.DataFrame] = None,
     tick_regime_report(feat, config)
     passive_tables = run_phase0_screen(feat, config, usable or [primary])
     policy_tables = run_passive_policy(feat, config, primary)
+    wave_table = wave_comparison(feat, config, primary, fold_metrics)
 
     # model comparison table (mean OOS metrics per model)
     if not fold_metrics.empty:
@@ -1739,6 +1866,7 @@ def run_full(config: Config, df_raw: Optional[pd.DataFrame] = None,
         "regime_table": regime_t,
         "passive_tables": passive_tables,
         "policy_tables": policy_tables,
+        "wave_table": wave_table,
         "ref_mid": float(feat["midprice"].mean()),
         "mean_spread": float(feat["spread"].mean()),
     }
@@ -1961,6 +2089,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                        help="use the labeled synthetic generator")
         p.add_argument("--synthetic-days", type=int, default=15)
         p.add_argument("--synthetic-events", type=int, default=3000)
+        p.add_argument("--features", default=None,
+                       help="cached features.parquet from an earlier run; "
+                            "skips data prep entirely")
     pp = sub.add_parser("pilot", help="one-day Databento raw-to-feature audit")
     pp.add_argument("--data", required=True, nargs="+",
                     help="path(s) to ONE trading day of Databento mbp-10")
@@ -2016,6 +2147,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         out.write_text(passive.phase0_report_section(tables, cfg, primary))
         print(f"\nDone. Phase-0 screen: {out}")
         print(f"Tables in: {cfg.output_dir}")
+        return 0
+    if args.command == "run" and getattr(args, "features", None):
+        path = run_full(cfg, None, features_path=args.features)
+        print(f"\nDone. Report: {path}")
+        print(f"Tables & plots in: {cfg.output_dir}")
         return 0
     if args.command == "run":
         # Per-session streaming for the Databento path: a month of raw records

@@ -9,39 +9,48 @@ The eventual model expresses the drift of the midprice as
 μ_t = θ₁·OFI_t + θ₂·intensity_t + θ₃·Δspread_t + θ₄·u_t
 ```
 
-where `u_t` is the output of a wave / Duhamel response layer. **`u_t` has not
-been built.** Everything to its left has, and this repository currently
-contains the work needed to make the comparison `baseline + u_t` vs `baseline`
-meaningful — because without a measured baseline, a later improvement cannot be
-attributed to the wave layer.
+where `u_t` is the output of a wave / Duhamel response layer. A **first
+version of `u_t` now exists** (`M6_wave`, 2026-09-24): OFI convolved with a small
+basis of causal response kernels, weights fitted on train days only. It is
+scored against the measured baseline `M5_full` — see *Stage 2 — first result*.
 
 ## Roadmap
 
 | stage | status |
 |---|---|
-| **1. Order-book / OFI baseline** | built and measured on two complete runs — see below |
-| 1b. Passive (maker) tradability | measured; promising but **not settled** — exit costs unmodelled |
-| 2. Wave / Duhamel response layer (`u_t`) | not started |
+| **1. Order-book / OFI baseline** | built and measured on three complete runs — see below |
+| 1b. Passive (maker) tradability | **settled negative** (2026-09-24) — loses at every queue position, before and after exit costs |
+| **2. Wave / Duhamel response layer (`u_t`)** | first version built; **+15% OOS correlation at 100 ms, 8/8 days, CI excludes zero**; not significant at 1 s |
 | 3. Kinetic / Fokker–Planck layer | not started |
 
 ## Layout
 
 ```
 wave-length/
-├── data/pilot/          20 days of INTC mbp-10 (dbn.zst + parquet), 4.7 GB
-└── ofi_research/        stage 1 — see ofi_research/README.md for the module map
+├── data/pilot/          20 days of INTC mbp-10, 4.7 GB — NOT in git (see below)
+└── ofi_research/        stages 1-2 — see ofi_research/README.md for the module map
     ├── configs/         baseline_intc.json, passive_wf_intc.json
     ├── outputs/
-    │   ├── baseline/    ORIGINAL M1-based run (superseded, kept for history)
-    │   ├── baseline_m5/ first complete run — taker + Phase 0 screen
-    │   ├── passive_wf/  current headline run — Phase 0 walk-forward
-    │   └── pilot_audit/ one-day raw-to-feature audit (protocol gate)
-    └── tests/           180 tests
+    │   ├── baseline/       ORIGINAL M1-based run (superseded, kept for history)
+    │   ├── baseline_m5/    first complete run — taker + Phase 0 screen
+    │   ├── passive_wf/     2026-09-13 run — maker PASS was a simulator bug; VOID
+    │   ├── passive_wf_v2/  current reference — corrected maker study + M6_wave
+    │   └── pilot_audit/    one-day raw-to-feature audit (protocol gate)
+    └── tests/           200 tests
 ```
 
-`outputs/passive_wf/` is the current reference. `outputs/baseline/` predates the
-`M5_full` reference model and mislabels M5 numbers as M1 — read it as history,
-not as a result.
+`outputs/passive_wf_v2/` is the current reference. `outputs/passive_wf/` is kept
+only as the record of the bug described under *Stage 1b*. `outputs/baseline/`
+predates the `M5_full` reference model and mislabels M5 numbers as M1.
+
+**Data is not in the repository.** The raw files exceed GitHub's 100 MB limit, so
+`data/` was removed from history and is gitignored. Copy `data/pilot/` from a
+machine that has it, or re-buy it one day at a time with
+`python3 -m ofi_research.fetch_pilot_day --symbol INTC --date YYYY-MM-DD`
+(needs `DATABENTO_API_KEY`; this is a paid download). A run also writes `features.parquet` (the sampled decision frame) and
+`passive_tapes/` into its output directory; both are regenerable caches and
+gitignored. `run --features <run>/features.parquet --output <run>` reuses them
+and skips the ~4.5 h data prep.
 
 ---
 
@@ -130,72 +139,159 @@ strategy.
 Decile edges here are cut pooled over the whole sample and therefore peek. That
 is why the walk-forward below exists.
 
-## Phase 0 walk-forward — the fitted gate (`outputs/passive_wf/`)
+That screen infers fills on the 200 ms decision clock and prices them at the
+PREVIOUS decision row's quote, so it measures something different from the
+event-level simulator below. Its decile ordering is still the reason the filter
+was worth testing; its unconditional number is superseded.
 
-Strictly harder than the screen on four axes: the gate threshold is fitted on
-**train days only**, queue position is a swept dial rather than a free
-assumption, cancels are assumed to leave from behind us, and both quoting and
-cancelling pay latency. Fills simulate at event resolution; the gate stays on
-the 200 ms decision clock.
+## Walk-forward maker (`outputs/passive_wf_v2/`) — settled negative
 
-All five passive criteria PASS and the report says **Proceed: YES**.
-**Do not act on that verdict yet** — three problems, in order of severity.
+The gate threshold is fitted on **train days only**, queue position is swept,
+cancels are assumed to leave from behind us, quoting and cancelling pay latency,
+and fills simulate at event resolution. Every result below is at zero rebate,
+1 s markout, on the 8 held-out test days.
 
-### 1. Exit costs are omitted, and they dominate
+### The earlier PASS was a simulator bug
 
-Table `23` carries `markout_after_crossing_out_ticks` — markout minus half the
-spread, i.e. the cost of flattening the position — and **no gate criterion
-consults it**:
+The 2026-09-13 run (`outputs/passive_wf/`) passed every maker criterion with
+**+0.255 ticks** per unconditional front-of-queue fill. That number was an
+artifact. Each tape row carries the book **after** its event, and on INTC 65% of
+sell prints (69% of sell volume) arrive on a row whose bid has already dropped —
+the print cleared the level. The simulator charged each print to its own row, so
+a level-clearing fill was credited one level lower, a tick better than it
+printed, or lost outright when the price change ended the queue episode first.
+Precisely the most adverse fills disappeared. The same mechanism explains both
+open puzzles from that run: the sign flip against Phase 0, and back-of-queue
+cells looking *better* than mid-queue ones.
 
-| gate | queue | markout | after crossing out |
-|---|---|---|---|
-| 0.3 | 0.00 | +0.272 | **−0.980** |
-| 0.3 | 0.25 | +0.121 | **−1.138** |
-| 0.3 | 1.00 | +0.203 | **−1.007** |
+`precompute_side` now charges each print to the book it traded against; two
+tests pin it and fail on the old code. Fill counts roughly triple once the
+level-clearing fills are counted.
 
-**All 20 zero-rebate cells fall in −1.156 … −0.945 ticks.** The headline assumes
-inventory unwinds at mid for free; a typical 0.20–0.30 tick add rebate still
-leaves roughly −0.7. The honest statement is a **bracket of [−1.0, +0.25] ticks
-per fill**, whose width is set by how much inventory unwinds passively — and
-inventory is not modelled at all (no limit, no unwind policy).
+### Corrected result: negative everywhere
 
-The same column exists in the Phase-0 screen (table `20`): −1.39 ticks at 1 s.
+| filter (gate quantile) | front of queue | 0.25 | 0.5 | behind all depth |
+|---|---|---|---|---|
+| none (quote always) | −0.260 | −0.391 | −0.424 | −0.289 |
+| 0.5 | −0.232 | −0.376 | −0.408 | −0.275 |
+| 0.9 (most selective) | −0.214 | −0.329 | −0.375 | −0.266 |
 
-### 2. Two criteria pass on noise, chosen from 100 cells
+Markout in ticks per fill, which still assumes the position can be sold at mid
+for free. **All 20 zero-rebate cells are negative**, t between −2.4 and −12.9.
 
-* `filter_beats_unconditional` — 0.2716 vs 0.2551 is **+0.017 ticks against
-  SE 0.035**, about half a standard error. Down the gate column at front of
-  queue: 0.255 → 0.272 → 0.264 → 0.257 → 0.242. Flat and non-monotonic. The OFI
-  gate adds nothing measurable there; it only cuts fills 115k → 12k.
-* `survives_back_of_queue` — quotes the queue=1.0 / gate=0.9 cell: 1,111 fills,
-  SE 0.336, **t = 0.75**. The gate picks the largest point estimate across 100
-  cells with no multiplicity adjustment, and that cell is the noisiest.
+### Exit costs, now simulated
 
-The back-of-queue claim is nonetheless defensible via a better cell:
-queue=1.0 / gate=0.3 gives **+0.203 ticks at t = 5.48**.
+Each fill is flattened by a pegged passive order at the opposite touch — same
+queue position as the entry, re-pegging when the touch moves — and crossed if it
+has not filled by the timeout (`passive.unwind_timeouts_ms`). This replaces the
+old bracket with a number inside it:
 
-### 3. Unexplained sign flip against Phase 0
+| filter | queue | free exit at mid | 1 s timeout | 5 s timeout | crossing every exit |
+|---|---|---|---|---|---|
+| none | front | −0.260 | −0.864 | −0.561 | ≈ −1.56 |
+| 0.9 | front | −0.214 | −0.758 | **−0.472** | |
+| 0.9 | behind all | −0.266 | −1.202 | −0.811 | −1.478 |
 
-Same 20 days, both nominally unconditional and front-of-queue:
+The best round trip anywhere in the sweep is **−0.47 ticks**. Break-even needs
+**+0.505 ticks of rebate per share** (paid on the entry and on the 60% of exits
+that fill passively), against a typical US add tier of 0.20–0.30.
 
-| | markout @ 1 s | fills/day |
+### Does the filter help at all?
+
+Yes, a little. Paired day by day against quoting always at the same queue
+position, the best filter adds **+0.029 ticks per fill (t = 4.01)** — just short
+of the Bonferroni bar of 4.41 for the 16 comparisons searched, and about 1/20th
+of what would be needed. The OFI signal is real; it is too small to pay for the
+adverse selection a maker takes on.
+
+### Gate (table `25`)
+
+| criterion | status | basis |
 |---|---|---|
-| Phase 0, table `20` | **−0.0537** | 2,961 |
-| Policy grid, gate=0 / queue=0 | **+0.2551** | 14,376 |
+| `markout_positive_significant` | FAIL | best cell −0.266 ticks |
+| `filter_beats_unconditional` | FAIL | +0.029 ticks, t = 4.01 vs 4.41 |
+| `survives_back_of_queue` | FAIL | −0.266 ticks |
+| `positive_after_exit_costs` | FAIL | −0.81 ticks, t = −5.43 (best by t) |
+| `rebate_not_load_bearing` | FAIL | needs +0.505 ticks |
 
-`gq ≤ 0` sets `thr = −inf`, so both sides really are quoted always, and sides are
-pooled. The likely cause is that Phase 0 infers fills on the decision clock
-while the policy simulates at event resolution with queue mechanics — but until
-that is reconciled, **one of the two is mismeasuring**.
-
-### What is actually supported
-
-Gated passive markout is positive and significant across queue positions —
-t ≈ 3–5.5 in well-populated cells — **before exit costs**. That is a real signal
-and worth pursuing. It is **not** yet evidence that the maker business makes
-money.
+**Conclusion: OFI is not tradable on INTC at this horizon, as taker or as
+maker.** Both negative verdicts are about effect size, not tuning. Any future
+trading claim needs a different signal, a different symbol (a large-tick name,
+run as a separate replication), or both.
 
 ---
+
+# Stage 2 — first result
+
+`M6_wave` = `M5_full` + the wave group and nothing else, so any difference is
+attributable to `u_t`. The wave group is level-1 OFI increments convolved, in
+continuous time and per segment, with five causal kernels
+(`features.wave_kernels`): `exp(−Δt/τ)` for τ = 100 ms, 400 ms and 1.6 s, and
+the damped-oscillator pair `exp(−Δt/1 s)·sin/cos(2πΔt/2 s)`, i.e. the Green's
+function of `u'' + 2γu' + ω²u = OFI`. The kernel `G = Σ w_k φ_k` is fitted by
+the walk-forward regression on train days only. The timescales were read off the
+pooled stage-1 response table — a mild hyperparameter peek, disclosed.
+
+| horizon | M5_full corr | M6_wave corr | Δcorr | 95% CI (day bootstrap) | days Δ>0 | ΔR² | days ΔR²>0 |
+|---|---|---|---|---|---|---|---|
+| **100 ms** | 0.04774 | 0.05509 | **+0.00735 (+15%)** | **[+0.00591, +0.00927]** | **8/8** | +0.000670 | 8/8 |
+| 250 ms | | | *pending* | | | | |
+| 500 ms | | | *pending* | | | | |
+| 1 s | 0.02214 | 0.02419 | +0.00205 (+9%) | [−0.00038, +0.00422] | 7/8 | +0.000078 | 7/8 |
+
+250 ms and 500 ms were still running when this was written; they land in
+`outputs/passive_wf_v2/26_wave_vs_baseline.csv` and the run's report.
+
+`M5_full` reproduces the 2026-09-13 number exactly (0.02214), so the
+comparison is against the same baseline.
+
+**Reading it.** Where the stage-1 response is strongest, 100 ms, the wave layer
+improves on the full baseline on **every one of the 8 test days** and the
+interval excludes zero. At 1 s, the tail of the response, the gain is a third
+the size and not significant. That is the shape the brief predicted: `u_t`
+captures the sub-second response body that the box-window features blur. For
+scale, the spread/depth group moved 1 s correlation by +0.011 (M1 → M2).
+
+A positive Δ is a predictive improvement only — it does not make anything
+tradable (see *Stage 1b*).
+
+---
+
+# Work completed (2026-09-24)
+
+## Repository pushed to GitHub
+
+`data/` (40 files, 30 over 100 MB) was stripped from history with
+`git filter-branch` and gitignored. That checkout deleted `data/` from the
+working tree; it was restored from the local branch `backup/pre-strip-data`,
+which still holds the original history. **Keep that branch** until the data is
+backed up somewhere else.
+
+## Passive simulator and gate
+
+* Fills are charged to the pre-trade book (the bug above).
+* `simulate_unwind`: pegged passive exit with a crossing timeout.
+* `policy_gate`: every criterion picks its cell by day-clustered t and must
+  clear a Bonferroni critical value over the family it searched
+  (`passive.gate_family_alpha`); `filter_beats_unconditional` is a day-paired
+  test; the verdict rests on `positive_after_exit_costs`; criteria can read
+  `NOT_EVALUABLE`.
+* The report section adds a *What does getting out cost?* table and picks
+  cells by t rather than by the largest point estimate.
+
+## Stage 2
+
+`add_wave_features` / `_causal_kernel_filter` in `features.py` (exact, chunked,
+checked against an O(n²) definition and added to the truncation leakage test),
+the `wave` feature group, `M6_wave` in the ladder, and `wave_comparison` —
+table `26_wave_vs_baseline`, scored at `evaluation.wave_horizons`.
+
+## Feature cache
+
+`evaluation.save_feature_frame` writes `features.parquet`; `run --features`
+loads it and skips data prep.
+
+20 tests added (**200 total**). Full run: 20 days, ~6 h to the maker and 1 s results.
 
 # Work completed (2026-09-13)
 
@@ -232,8 +328,8 @@ context. 8 tests added (**180 total**).
 
 ## First Phase 0 walk-forward on real data
 
-`configs/passive_wf_intc.json`, 20 days, 4h55m wall clock. Findings and caveats
-above. The maker rebate is deliberately **not** set to a single value: the config
+`configs/passive_wf_intc.json`, 20 days, 4h55m wall clock. Its maker PASS was
+later traced to a simulator bug and is void — see *Stage 1b*. The maker rebate is deliberately **not** set to a single value: the config
 sweeps `[0, 0.0010, 0.0020, 0.0025, 0.0030]` and the gate reports a break-even,
 so the output is a bracket rather than an invented venue number.
 
@@ -247,23 +343,21 @@ The new run emits `oos_pred_corr_M5_full` correctly.
 
 # Known issues
 
-- **Exit costs are unmodelled in every passive result.** The headline
-  `markout_ticks` assumes free unwinding at mid; `markout_after_crossing_out`
-  assumes crossing on every fill. Reality is between, and no criterion reports
-  the bracket. This is the single largest gap.
-- **The passive decision gate selects the best of 100 cells** without a
-  multiplicity adjustment, and `survives_back_of_queue` currently passes on a
-  t = 0.75 cell.
-- **Phase 0 and the policy grid disagree in sign** on the unconditional
-  front-of-queue markout (−0.054 vs +0.255). Unreconciled.
 - **Queue position cannot be measured from MBP-10** — it is swept, and the
   bracket is the result.
+- **Each fill is unwound independently.** No inventory limit, and a long fill
+  is not netted against a later short one. Netting would cut crossing costs
+  somewhat; it cannot close a −0.47 tick gap.
+- **Taker fees on crossed exits are not charged**, which flatters every unwind
+  number slightly.
+- **Phase 0 prices fills at the previous decision row's quote** and so is not
+  comparable to the event-level simulator; kept for its decile ordering only.
 - **`07b_leave_one_group_out` cost 54 minutes** for one 7-row table and is the
   peak-memory stage. Off by default.
 - One symbol only. `18_tick_regime` records the preregistration requirement:
   a large-tick name must be a **separate** replication, never pooled.
-- `outputs/passive_wf/passive_tapes/` is 556 MB of regenerable cache. It should
-  be gitignored rather than committed.
+- `outputs/passive_wf/passive_tapes/` (556 MB) is still tracked from before the
+  ignore rule; new runs' tapes are ignored.
 
 ## Memory — measured, not estimated
 
@@ -289,18 +383,16 @@ starting anyway.
 
 # Next steps
 
-1. **Close the exit-cost gap.** Add a criterion that reports the
-   [cross-out, no-cross-out] bracket instead of one end, and decide what
-   fraction of inventory realistically unwinds passively. Until this is done the
-   maker path has no verdict — the current PASS is the optimistic end of its own
-   bracket.
-2. **Reconcile Phase 0 against the policy grid**, and require significance
-   rather than the largest point estimate for `survives_back_of_queue`.
-3. **Then build `u_t`** — see the brief below.
-
-Note that (1)–(2) and (3) answer different questions. The wave layer can be
-validated as a **predictive improvement** even if the signal is never tradable —
-just don't let a positive Δcorr be read as "now it trades."
+1. **Push `u_t` where the response lives.** The brief below predicts the wave
+   layer matters most at 100–500 ms; table `26` says whether it does. If it
+   helps there, iterate on the kernel basis using the feature cache — a kernel
+   change still needs event-resolution OFI, so it needs one prep run, but model
+   and horizon changes do not.
+2. **Significance, not direction.** With 8 test days the fold-bootstrap
+   interval is wide. More test days (extend the data) is the cheapest way to
+   tighten it.
+3. **Tradability is closed on this symbol.** Reopen it only with a new signal or
+   a large-tick replication; do not rerun the maker grid hoping for a sign.
 
 ---
 

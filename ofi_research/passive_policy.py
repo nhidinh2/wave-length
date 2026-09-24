@@ -111,11 +111,20 @@ def precompute_side(px: np.ndarray, sz: np.ndarray, vol: np.ndarray,
     Episode boundaries and cumulative consumption are functions of the tape
     alone, so recomputing them for each (gate, queue) pair would repeat an
     O(n) pass over millions of events a hundred times per fold for nothing.
+
+    Every tape row carries the book AFTER its event, so the volume printed on
+    row ``i`` traded against the book standing at row ``i - 1``. On INTC
+    2026-07-29, 65% of sell prints arrive on a row whose bid has already
+    dropped — the print cleared the level. Charging that volume to row ``i``
+    credits the fill to the NEXT level, a tick better than it printed, and
+    loses it outright when the price change ends the episode first: exactly
+    the most toxic fills vanish. So consumption is indexed by the book it hit:
+    ``cum`` advances at row ``r`` by what printed on row ``r + 1``.
     """
+    n = len(px)
     starts, ends = _episode_bounds(px, seg)
     consumed = vol.astype(np.float64)
     if not cancels_leave_from_behind:
-        n = len(px)
         d_sz = np.zeros(n, dtype=np.float64)
         d_sz[1:] = sz[:-1].astype(np.float64) - sz[1:].astype(np.float64)
         cancels = np.maximum(d_sz - vol, 0.0)
@@ -123,8 +132,12 @@ def precompute_side(px: np.ndarray, sz: np.ndarray, vol: np.ndarray,
                                  | (seg[1:] != seg[:-1])))
         cancels[np.flatnonzero(new_ep)] = 0.0
         consumed = consumed + cancels
+    # Re-index onto the pre-event book; never across a segment boundary.
+    on_book = np.zeros(n, dtype=np.float64)
+    if n > 1:
+        on_book[:-1] = np.where(seg[1:] == seg[:-1], consumed[1:], 0.0)
     return {"starts": starts, "ends": ends,
-            "cum": np.concatenate(([0.0], np.cumsum(consumed)))}
+            "cum": np.concatenate(([0.0], np.cumsum(on_book)))}
 
 
 def simulate_side_fills(ts: np.ndarray, px: np.ndarray, sz: np.ndarray,
@@ -174,14 +187,16 @@ def simulate_side_fills(ts: np.ndarray, px: np.ndarray, sz: np.ndarray,
     # 4. Consumption: trades always eat the queue, and cancellations only do
     #    when we assume the departing shares were in FRONT of us — see
     #    precompute_side, where that choice is made once per tape.
-    cum = pre["cum"]                                     # cum[i] = sum(:i)
-    # Fill at the first row whose cumulative consumption since joining exceeds
-    # the queue ahead. cum is non-decreasing, so this is one binary search.
+    cum = pre["cum"]          # cum[r] = volume that hit books 0..r-1
+    # The book row whose consumption first exceeds the queue ahead is the one
+    # we were resting in when filled; the print itself is the NEXT row, and
+    # that is the fill's time. cum is non-decreasing, so one binary search.
     target = cum[j] + queue_ahead
-    fill = np.searchsorted(cum[1:], target, side="right").astype(np.int64)
-    alive &= (fill < n)
-    fill = np.where(alive, np.minimum(fill, n - 1), 0)
-    alive &= (fill <= ends) & (fill >= j)
+    rest = np.searchsorted(cum[1:], target, side="right").astype(np.int64)
+    alive &= (rest < n - 1)
+    rest = np.where(alive, rest, 0)
+    alive &= (rest <= ends) & (rest >= j)
+    fill = rest + 1
 
     # 5. A withdrawal decided inside the episode stops protecting us only after
     #    the cancel round trip; trades before that still fill us.
@@ -189,7 +204,7 @@ def simulate_side_fills(ts: np.ndarray, px: np.ndarray, sz: np.ndarray,
     has_off = off <= ends
     deadline = np.where(has_off, ts[np.minimum(off, n - 1)] + cancel_latency_ns,
                         np.iinfo(np.int64).max)
-    alive &= ts[fill] <= deadline
+    alive &= ts[np.minimum(fill, n - 1)] <= deadline
 
     keep = np.flatnonzero(alive)
     return {"fill_idx": fill[keep], "join_idx": j[keep],
@@ -220,6 +235,87 @@ def _markout(tape: pd.DataFrame, fill_idx: np.ndarray, fill_px: np.ndarray,
             "fill_idx": fill_idx[ok], "ok": ok}
 
 
+def simulate_unwind(ts: np.ndarray, seg: np.ndarray, fill_idx: np.ndarray,
+                    fill_px: np.ndarray, side: int, exit_px: np.ndarray,
+                    exit_sz: np.ndarray, cross_px: np.ndarray,
+                    exit_pre: Dict[str, np.ndarray], alpha: float,
+                    place_latency_ns: int, timeouts_ms: List[float]
+                    ) -> Dict[str, np.ndarray]:
+    """Flatten each fill with a pegged passive exit, crossing on timeout.
+
+    A long fill rests an ask at the touch (``exit_px`` is the ask series,
+    ``exit_pre`` its :func:`precompute_side` over BUY aggressor volume) and a
+    short fill rests a bid. The exit joins behind ``alpha`` of displayed depth,
+    one latency after the fill, and fills by the same consumption rule as the
+    entry. When the touch moves the exit loses its place and re-joins at the
+    new touch one latency later — a peg, and pessimistic in the same way the
+    entry is. If it has not filled by ``timeout`` the position is crossed at
+    ``cross_px`` (the bid for a long) one latency after the deadline.
+
+    The simulation is run once to the longest timeout; a shorter one keeps only
+    the passive exits that happened before its own deadline and crosses the
+    rest, which is exactly what running it separately would produce.
+
+    Returns, per timeout, the round-trip P&L in price units per share (NaN
+    where the exit would leave the segment — dropped, as in ``_markout``) and
+    whether the exit was passive, which decides whether it earns a rebate.
+    """
+    n = len(ts)
+    nf = fill_idx.size
+    starts, ends = exit_pre["starts"], exit_pre["ends"]
+    cum = exit_pre["cum"]
+    t_max = int(max(timeouts_ms) * 1_000_000)
+    deadline = ts[fill_idx] + t_max
+    exit_ts = np.full(nf, np.iinfo(np.int64).max, dtype=np.int64)
+    exit_price = np.full(nf, np.nan)
+
+    j = np.searchsorted(ts, ts[fill_idx] + place_latency_ns, side="left")
+    active = (j < n)
+    active[active] &= seg[j[active]] == seg[fill_idx[active]]
+    while active.any():
+        a = np.flatnonzero(active)
+        ja = j[a]
+        ep_end = ends[np.searchsorted(starts, ja, side="right") - 1]
+        target = cum[ja] + alpha * exit_sz[ja]
+        rest = np.searchsorted(cum[1:], target, side="right")
+        hit = (rest <= ep_end) & (rest < n - 1)
+        hit_ts = ts[np.minimum(rest + 1, n - 1)]
+        hit &= hit_ts <= deadline[a]
+        done = a[hit]
+        exit_ts[done] = hit_ts[hit]
+        exit_price[done] = exit_px[ja[hit]]
+        # Not filled in this queue: re-peg at the next touch, if still in time.
+        miss = a[~hit]
+        nxt = ep_end[~hit] + 1
+        ok = nxt < n
+        nxt_c = np.minimum(nxt, n - 1)
+        ok &= seg[nxt_c] == seg[fill_idx[miss]]
+        nj = np.searchsorted(ts, ts[nxt_c] + place_latency_ns, side="left")
+        ok &= (nj < n)
+        nj_c = np.minimum(nj, n - 1)
+        ok &= (ts[nj_c] <= deadline[miss]) & (seg[nj_c] == seg[fill_idx[miss]])
+        j[miss] = nj_c
+        active[:] = False
+        active[miss[ok]] = True
+
+    out: Dict[str, np.ndarray] = {}
+    entry_ts = ts[fill_idx]
+    for T in timeouts_ms:
+        t_ns = int(T * 1_000_000)
+        passive = exit_ts <= entry_ts + t_ns
+        c = np.searchsorted(ts, entry_ts + t_ns + place_latency_ns,
+                            side="left")
+        c_ok = c < n
+        c = np.minimum(c, n - 1)
+        c_ok &= seg[c] == seg[fill_idx]
+        px_out = np.where(passive, exit_price, cross_px[c])
+        pnl = side * (px_out - fill_px)
+        pnl = np.where(passive | c_ok, pnl, np.nan)
+        out[f"pnl_{int(T)}"] = pnl
+        out[f"passive_{int(T)}"] = passive
+    return out
+
+
 # --------------------------------------------------------------------------
 # Walk-forward policy
 # --------------------------------------------------------------------------
@@ -238,6 +334,31 @@ def _gate_on_tape(tape_ts: np.ndarray, dec_ts: np.ndarray,
     live = pos > 0
     out[live] = dec_gate[pos[live] - 1]
     return out
+
+
+def _cell_day_means(g: pd.DataFrame, col: str,
+                    weight_col: str = "n_fills") -> pd.Series:
+    """One number per day for a cell, sides pooled by their fill counts."""
+    def _one(x):
+        w = x[weight_col].to_numpy(dtype="float64")
+        v = x[col].to_numpy(dtype="float64")
+        ok = np.isfinite(v) & (w > 0)
+        return np.average(v[ok], weights=w[ok]) if ok.any() else np.nan
+    return g.groupby("session_date").apply(_one, include_groups=False)
+
+
+def _pooled_days(g: pd.DataFrame, col: str,
+                 weight_col: str = "n_fills") -> Dict[str, float]:
+    """Fill-weighted mean, with a SE clustered on days rather than fills."""
+    w = g[weight_col].to_numpy(dtype="float64")
+    v = g[col].to_numpy(dtype="float64")
+    ok = np.isfinite(v) & (w > 0)
+    mean = float(np.average(v[ok], weights=w[ok])) if ok.any() else np.nan
+    dm = _cell_day_means(g, col, weight_col).dropna()
+    nd = int(dm.size)
+    se = float(dm.std(ddof=1)) / np.sqrt(nd) if nd > 1 else np.nan
+    t = mean / se if se == se and se > 0 else np.nan
+    return {"mean": mean, "se": se, "t": t, "n_days": nd}
 
 
 def _day_clustered(values: np.ndarray, days: np.ndarray) -> Dict[str, float]:
@@ -322,12 +443,9 @@ def run_passive_walk_forward(feat: pd.DataFrame, config: Config,
         seg = tape["segment_id"].to_numpy()
         svi = tape["signed_volume_increment"].to_numpy(dtype="float64")
 
-        for side, side_name in SIDES:
-            # A resting bid fills us long, so it is quoted when the model
-            # predicts UP; the ask is its mirror. Both decisions predate the
-            # fill they might receive.
-            aligned_tr = side * np.asarray(pred_tr)
-            aligned_te = side * pred_te_sorted
+        # Both books up front: each side's entry is the other side's exit.
+        book = {}
+        for side, _ in SIDES:
             px = (tape["bid_price_1"] if side > 0
                   else tape["ask_price_1"]).to_numpy(dtype="float64")
             sz = (tape["bid_size_1"] if side > 0
@@ -335,8 +453,17 @@ def run_passive_walk_forward(feat: pd.DataFrame, config: Config,
             # Sell aggressors (negative signed volume) hit the bid; buy
             # aggressors lift the ask.
             vol = np.maximum(-svi, 0.0) if side > 0 else np.maximum(svi, 0.0)
-            pre = precompute_side(px, sz, vol, seg,
-                                  pcfg.cancels_leave_from_behind)
+            book[side] = (px, sz, vol, precompute_side(
+                px, sz, vol, seg, pcfg.cancels_leave_from_behind))
+
+        for side, side_name in SIDES:
+            # A resting bid fills us long, so it is quoted when the model
+            # predicts UP; the ask is its mirror. Both decisions predate the
+            # fill they might receive.
+            aligned_tr = side * np.asarray(pred_tr)
+            aligned_te = side * pred_te_sorted
+            px, sz, vol, pre = book[side]
+            x_px, x_sz, _, x_pre = book[-side]
 
             for gq in pcfg.gate_quantiles:
                 thr = (-np.inf if gq <= 0
@@ -355,7 +482,7 @@ def run_passive_walk_forward(feat: pd.DataFrame, config: Config,
                                   side, horizon_ms)
                     if mk["markout"].size == 0:
                         continue
-                    per_day.append({
+                    rec = {
                         "fold": fold.index, "session_date": day,
                         "side": side_name, "gate_quantile": float(gq),
                         "queue_ahead_fraction": float(alpha),
@@ -364,7 +491,24 @@ def run_passive_walk_forward(feat: pd.DataFrame, config: Config,
                         "mean_markout": float(mk["markout"].mean()),
                         "mean_cross_out": float(mk["cross_out"].mean()),
                         "sum_markout": float(mk["markout"].sum()),
-                    })
+                    }
+                    # The long's exit crosses at the bid, which is its own
+                    # quote series; the short's crosses at the ask.
+                    unw = simulate_unwind(
+                        ts, seg, mk["fill_idx"],
+                        sim["fill_price"][mk["ok"]], side, x_px, x_sz, px,
+                        x_pre, float(alpha), place_ns,
+                        pcfg.unwind_timeouts_ms)
+                    for T in pcfg.unwind_timeouts_ms:
+                        p = unw[f"pnl_{int(T)}"]
+                        ok = np.isfinite(p)
+                        rec[f"n_unwind_{int(T)}"] = int(ok.sum())
+                        rec[f"mean_unwind_{int(T)}"] = (
+                            float(p[ok].mean()) if ok.any() else np.nan)
+                        rec[f"frac_passive_exit_{int(T)}"] = (
+                            float(unw[f"passive_{int(T)}"][ok].mean())
+                            if ok.any() else np.nan)
+                    per_day.append(rec)
 
     if not per_day:
         logger.warning("Passive policy: no fills in any fold")
@@ -392,7 +536,22 @@ def run_passive_walk_forward(feat: pd.DataFrame, config: Config,
         n_fills = int(g["n_fills"].sum())
         for rebate in config.passive.rebate_sweep:
             m = mean_mk + float(rebate)
-            rows.append({
+            unwind = {}
+            for T in config.passive.unwind_timeouts_ms:
+                k = int(T)
+                # A passive exit earns the rebate a second time; a crossed
+                # one pays nothing extra here (taker fees are not modelled).
+                val = (g[f"mean_unwind_{k}"]
+                       + float(rebate) * (1.0 + g[f"frac_passive_exit_{k}"]))
+                st = _pooled_days(g.assign(_v=val), "_v", f"n_unwind_{k}")
+                unwind.update({
+                    f"unwind_{k}ms_ticks": st["mean"] / tick,
+                    f"unwind_{k}ms_se_ticks": st["se"] / tick,
+                    f"unwind_{k}ms_t": st["t"],
+                    f"unwind_{k}ms_passive_exit_frac": _pooled_days(
+                        g, f"frac_passive_exit_{k}", f"n_unwind_{k}")["mean"],
+                })
+            rows.append({**unwind,
                 "horizon": horizon_tag, "model": model_name,
                 "gate_quantile": float(gq),
                 "queue_ahead_fraction": float(alpha),
@@ -449,7 +608,9 @@ def policy_report_section(tables: Dict[str, pd.DataFrame],
 
     # --- queue position ---
     out.append("\n### How far back in the queue does the edge survive?\n")
-    out.append("\nZero rebate, best gate per queue position.\n\n")
+    out.append("\nZero rebate; per queue position, the gate with the largest "
+               "day-clustered t (not the largest point estimate, which "
+               "favours the noisiest cell).\n\n")
     out.append("| queue ahead | best gate | markout (ticks) | t | fills/day | "
                "days |\n|---|---|---|---|---|---|\n")
     for alpha, g in zero.groupby("queue_ahead_fraction"):
@@ -457,7 +618,7 @@ def policy_report_section(tables: Dict[str, pd.DataFrame],
         if g.empty:
             out.append(f"| {alpha:.2f} × depth | — | too few fills | | | |\n")
             continue
-        b = g.loc[g["markout_ticks"].idxmax()]
+        b = g.loc[g["t_stat"].fillna(-np.inf).idxmax()]
         out.append(f"| {alpha:.2f} × depth | q={b['gate_quantile']:.2f} | "
                    f"{b['markout_ticks']:.4f} | "
                    f"{b['t_stat']:.2f} | {b['fills_per_day']:.0f} | "
@@ -484,17 +645,54 @@ def policy_report_section(tables: Dict[str, pd.DataFrame],
                "pooled decile ordering did not survive being fitted on one "
                "set of days and applied to another.\n"))
 
+    # --- exit costs ---
+    touts = [int(T) for T in config.passive.unwind_timeouts_ms
+             if f"unwind_{int(T)}ms_ticks" in zero.columns]
+    usable = zero[~zero["below_min_fills"]]
+    if touts and len(usable):
+        out.append("\n### What does getting out cost?\n")
+        out.append(
+            "\nMarkout values the position at mid, as if it could be sold "
+            "there for free. Here every fill is flattened by a pegged passive "
+            "exit at the opposite touch, crossed if it has not filled by the "
+            "timeout. The two bracket columns are the ends this must land "
+            "between. Zero rebate; best cell by t at each queue position.\n\n")
+        out.append("| queue ahead | timeout | gate | markout | unwound | t | "
+                   "passive exits | crossing every exit |\n"
+                   "|---|---|---|---|---|---|---|---|\n")
+        for alpha, g in usable.groupby("queue_ahead_fraction"):
+            for k in touts:
+                b = g.loc[g[f"unwind_{k}ms_t"].fillna(-np.inf).idxmax()]
+                out.append(
+                    f"| {alpha:.2f} × depth | {k} ms | "
+                    f"q={b['gate_quantile']:.2f} | {b['markout_ticks']:.4f} | "
+                    f"**{b[f'unwind_{k}ms_ticks']:.4f}** | "
+                    f"{b[f'unwind_{k}ms_t']:.2f} | "
+                    f"{100 * b[f'unwind_{k}ms_passive_exit_frac']:.0f}% | "
+                    f"{b['markout_after_crossing_out_ticks']:.4f} |\n")
+
     # --- rebate ---
     out.append("\n### How much of this is the rebate?\n")
     best_zero = zero[~zero["below_min_fills"]]
     if len(best_zero):
-        b = best_zero.loc[best_zero["markout_ticks"].idxmax()]
-        need = float(b["breakeven_rebate_ticks"])
+        k = touts[-1] if touts else None
+        tcol = f"unwind_{k}ms_t" if k else "t_stat"
+        b = best_zero.loc[best_zero[tcol].fillna(-np.inf).idxmax()]
+        if k:
+            f = float(b[f"unwind_{k}ms_passive_exit_frac"])
+            need = -float(b[f"unwind_{k}ms_ticks"]) / (1.0 + f)
+            what = (f"round trip at the {k} ms timeout is "
+                    f"{b[f'unwind_{k}ms_ticks']:.4f} ticks")
+        else:
+            need = float(b["breakeven_rebate_ticks"])
+            what = f"fill is {b['markout_ticks']:.4f} ticks"
         out.append(
-            f"\nThe best cell before any rebate is {b['markout_ticks']:.4f} "
-            f"ticks per fill (queue {b['queue_ahead_fraction']:.2f}×, "
-            f"gate q={b['gate_quantile']:.2f}). Break-even needs "
-            f"{need:+.3f} ticks of rebate ({need * tick:+.5f} per share). "
+            f"\nThe best cell before any rebate (queue "
+            f"{b['queue_ahead_fraction']:.2f}×, gate "
+            f"q={b['gate_quantile']:.2f}): its {what}. Break-even needs "
+            f"{need:+.3f} ticks of rebate per share "
+            f"({need * tick:+.5f}), paid on the entry and on every passive "
+            "exit. "
             + ("The business therefore does not depend on the schedule.\n"
                if need <= 0 else
                "A typical US add tier is 0.20-0.30 ticks, so this sits "
@@ -504,14 +702,15 @@ def policy_report_section(tables: Dict[str, pd.DataFrame],
                   if need <= 0.30 else
                   "BEYOND what any venue pays to add. No rebate rescues "
                   "it.\n")))
-        out.append("\n| rebate (ticks) | markout (ticks) | after crossing out "
-                   "|\n|---|---|---|\n")
+        ucol = f"unwind_{k}ms_ticks" if k else "markout_ticks"
+        out.append("\n| rebate (ticks) | markout (ticks) | unwound (ticks) | "
+                   "after crossing out |\n|---|---|---|---|\n")
         sel = grid[(grid["queue_ahead_fraction"] == b["queue_ahead_fraction"])
                    & (grid["gate_quantile"] == b["gate_quantile"])]
         for _, r in sel.sort_values("maker_rebate_per_unit").iterrows():
             out.append(
                 f"| {r['maker_rebate_per_unit'] / tick:.2f} | "
-                f"{r['markout_ticks']:.4f} | "
+                f"{r['markout_ticks']:.4f} | {r[ucol]:.4f} | "
                 f"{r['markout_after_crossing_out_ticks']:.4f} |\n")
         out.append("\nThese rebate tiers are ILLUSTRATIVE, not a schedule. "
                    "Replace `passive.rebate_sweep` with the venue's real "
@@ -527,65 +726,149 @@ def policy_report_section(tables: Dict[str, pd.DataFrame],
     return "".join(out)
 
 
+def _bonferroni_t(m: int, n_days: int, alpha: float) -> float:
+    """Two-sided day-clustered t critical value after searching ``m`` cells."""
+    from scipy import stats
+    return float(stats.t.ppf(1.0 - alpha / (2.0 * max(m, 1)),
+                             df=max(n_days - 1, 1)))
+
+
 def policy_gate(grid: pd.DataFrame, config: Config,
                 daily: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Decision gate for the PASSIVE path, replacing the taker one.
 
-    The taker gate asked whether a strategy that executed one trade in twenty
-    days was profitable. These ask the questions a maker actually faces: does
-    the filter beat quoting indiscriminately, does the edge survive being at
-    the back of the queue, and how much of the venue's rebate schedule is
-    load-bearing.
+    Every criterion searches a family of (gate, queue[, timeout]) cells and
+    keeps the one with the largest day-clustered t, so each is tested against
+    a Bonferroni critical value over that family rather than against 2.0 —
+    the previous gate passed ``survives_back_of_queue`` on a t = 0.75 cell
+    picked as the largest of 100 point estimates.
+
+    The verdict rests on ``positive_after_exit_costs``: markout alone assumes
+    inventory unwinds free at mid, and every zero-rebate cell of the last run
+    lost about a tick once the exit was paid for. The unwind is simulated
+    (:func:`simulate_unwind`), and the basis reports it beside both ends of
+    the bracket it lands in.
     """
     if grid is None or grid.empty:
         return pd.DataFrame()
     tick = config.costs.tick_size
+    fam_alpha = config.passive.gate_family_alpha
     zero_reb = grid[grid["maker_rebate_per_unit"] == 0.0]
-    ungated = zero_reb[zero_reb["gate_quantile"] == 0.0]
     gated = zero_reb[(zero_reb["gate_quantile"] > 0.0)
                      & (~zero_reb["below_min_fills"])]
+    nd = int(zero_reb["n_days"].max()) if len(zero_reb) else 0
 
-    def _best(df):
-        return df.loc[df["markout_ticks"].idxmax()] if len(df) else None
+    def _row(name, ok, basis, evaluable=True):
+        return {"criterion": name,
+                "status": ("NOT_EVALUABLE" if not evaluable
+                           else "PASS" if ok else "FAIL"),
+                "basis": basis}
+
+    def _best_t(df, tcol):
+        d = df[df[tcol].notna()]
+        return d.loc[d[tcol].idxmax()] if len(d) else None
 
     checks = []
-    b = _best(gated)
-    u = _best(ungated)
-    if b is not None and u is not None:
-        checks.append({
-            "criterion": "filter_beats_unconditional", "status":
-            "PASS" if b["markout_ticks"] > u["markout_ticks"] else "FAIL",
-            "basis": f"best gated {b['markout_ticks']:.4f} ticks vs "
-                     f"unconditional {u['markout_ticks']:.4f} at the same "
-                     f"queue position sweep, zero rebate"})
-    if b is not None:
-        checks.append({
-            "criterion": "positive_at_zero_rebate",
-            "status": "PASS" if b["markout_ticks"] > 0 else "FAIL",
-            "basis": f"best gated cell {b['markout_ticks']:.4f} ticks/fill "
-                     f"before any rebate"})
-        checks.append({
-            "criterion": "significant_day_clustered",
-            "status": "PASS" if (b["t_stat"] == b["t_stat"]
-                                 and abs(b["t_stat"]) >= 2.0) else "FAIL",
-            "basis": f"t = {b['t_stat']:.2f} over {int(b['n_days'])} days, "
-                     "day-clustered"})
-    back = zero_reb[(zero_reb["queue_ahead_fraction"] >= 1.0)
-                    & (zero_reb["gate_quantile"] > 0.0)
-                    & (~zero_reb["below_min_fills"])]
-    bb = _best(back)
-    if bb is not None:
-        checks.append({
-            "criterion": "survives_back_of_queue",
-            "status": "PASS" if bb["markout_ticks"] > 0 else "FAIL",
-            "basis": f"behind all displayed depth: {bb['markout_ticks']:.4f} "
-                     f"ticks/fill on {int(bb['n_fills'])} fills"})
-    if b is not None:
-        need = float(b["breakeven_rebate_ticks"])
-        checks.append({
-            "criterion": "rebate_not_load_bearing",
-            "status": "PASS" if need <= 0 else "FAIL",
-            "basis": (f"break-even needs {need:.3f} ticks of rebate "
-                      f"({need * tick:.5f} price units per share); a typical "
-                      "US add tier is 0.20-0.30 ticks")})
+
+    # 1. The gated markout, before any exit cost.
+    b = _best_t(gated, "t_stat")
+    crit = _bonferroni_t(len(gated), nd, fam_alpha)
+    checks.append(_row(
+        "markout_positive_significant",
+        b is not None and b["markout_ticks"] > 0 and b["t_stat"] >= crit,
+        "no evaluable gated cell" if b is None else
+        f"best of {len(gated)} gated cells by t: q={b['gate_quantile']:.2f}, "
+        f"queue {b['queue_ahead_fraction']:.2f}x, "
+        f"{b['markout_ticks']:.4f} ticks, t = {b['t_stat']:.2f} vs "
+        f"Bonferroni {crit:.2f} ({nd} days). Assumes free exit at mid",
+        evaluable=b is not None))
+
+    # 2. Does the filter beat quoting always, paired day by day?
+    paired = []
+    if daily is not None and len(daily):
+        for (gq, a), g in daily.groupby(["gate_quantile",
+                                         "queue_ahead_fraction"]):
+            if gq <= 0:
+                continue
+            base = daily[(daily["gate_quantile"] == 0.0)
+                         & (daily["queue_ahead_fraction"] == a)]
+            if base.empty:
+                continue
+            d = (_cell_day_means(g, "mean_markout")
+                 - _cell_day_means(base, "mean_markout")).dropna()
+            if d.size < 2:
+                continue
+            se = float(d.std(ddof=1)) / np.sqrt(d.size)
+            paired.append({"gq": gq, "alpha": a, "diff": float(d.mean()),
+                           "t": float(d.mean()) / se if se > 0 else np.nan,
+                           "n": int(d.size)})
+    pdf = pd.DataFrame(paired)
+    if len(pdf) and pdf["t"].notna().any():
+        bp = pdf.loc[pdf["t"].idxmax()]
+        crit_p = _bonferroni_t(len(pdf), int(bp["n"]), fam_alpha)
+        checks.append(_row(
+            "filter_beats_unconditional", bp["t"] >= crit_p,
+            f"best of {len(pdf)} gated-minus-ungated day-paired differences: "
+            f"q={bp['gq']:.2f} at queue {bp['alpha']:.2f}x, "
+            f"{bp['diff'] / tick:+.4f} ticks, t = {bp['t']:.2f} vs "
+            f"Bonferroni {crit_p:.2f}"))
+    else:
+        checks.append(_row("filter_beats_unconditional", False,
+                           "no per-day table to pair against",
+                           evaluable=False))
+
+    # 3. Behind all displayed depth.
+    back = gated[gated["queue_ahead_fraction"] >= 1.0]
+    bb = _best_t(back, "t_stat")
+    crit_b = _bonferroni_t(len(back), nd, fam_alpha)
+    checks.append(_row(
+        "survives_back_of_queue",
+        bb is not None and bb["markout_ticks"] > 0 and bb["t_stat"] >= crit_b,
+        "no evaluable back-of-queue cell" if bb is None else
+        f"best of {len(back)} cells behind all displayed depth: "
+        f"q={bb['gate_quantile']:.2f}, {bb['markout_ticks']:.4f} ticks on "
+        f"{int(bb['n_fills'])} fills, t = {bb['t_stat']:.2f} vs Bonferroni "
+        f"{crit_b:.2f}",
+        evaluable=bb is not None))
+
+    # 4. After paying to get out: the criterion the verdict rests on.
+    long_rows = []
+    for T in config.passive.unwind_timeouts_ms:
+        k = int(T)
+        col = f"unwind_{k}ms_ticks"
+        if col not in gated.columns:
+            continue
+        for _, r in gated.iterrows():
+            long_rows.append({**r.to_dict(), "timeout_ms": k,
+                              "unwind": r[col], "unwind_t": r[f"unwind_{k}ms_t"],
+                              "pexit": r[f"unwind_{k}ms_passive_exit_frac"]})
+    ul = pd.DataFrame(long_rows)
+    bu = _best_t(ul, "unwind_t") if len(ul) else None
+    crit_u = _bonferroni_t(len(ul), nd, fam_alpha)
+    checks.append(_row(
+        "positive_after_exit_costs",
+        bu is not None and bu["unwind"] > 0 and bu["unwind_t"] >= crit_u,
+        "unwind not simulated" if bu is None else
+        f"best of {len(ul)} (gate, queue, timeout) cells by t: "
+        f"q={bu['gate_quantile']:.2f}, queue {bu['queue_ahead_fraction']:.2f}x, "
+        f"{bu['timeout_ms']} ms timeout: {bu['unwind']:.4f} ticks per round "
+        f"trip, t = {bu['unwind_t']:.2f} vs Bonferroni {crit_u:.2f}; "
+        f"{100 * bu['pexit']:.0f}% of exits passive. Bracket for this cell: "
+        f"[{bu['markout_after_crossing_out_ticks']:.4f} crossing every exit, "
+        f"{bu['markout_ticks']:.4f} free exit at mid]",
+        evaluable=bu is not None))
+
+    # 5. How much of the round trip the venue has to pay for.
+    if bu is not None:
+        f = float(bu["pexit"]) if bu["pexit"] == bu["pexit"] else 0.0
+        need = -float(bu["unwind"]) / (1.0 + f)
+        checks.append(_row(
+            "rebate_not_load_bearing", need <= 0,
+            f"break-even needs {need:+.3f} ticks of rebate per share "
+            f"({need * tick:+.5f}) on the best round trip, counting the "
+            f"rebate on the entry and on the {100 * f:.0f}% of passive exits; "
+            "a typical US add tier is 0.20-0.30 ticks"))
+    else:
+        checks.append(_row("rebate_not_load_bearing", False,
+                           "unwind not simulated", evaluable=False))
     return pd.DataFrame(checks)
