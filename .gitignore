@@ -1,0 +1,13 @@
+# Event-resolution passive tapes are a regenerable cache written during data
+# prep (~556 MB per run). The tables derived from them are committed; the
+# tapes themselves are not.
+#
+# NOTE: outputs/passive_m5/passive_tapes/ was committed before this rule
+# existed and remains tracked — .gitignore does not affect already-tracked
+# files. Removing it needs a deliberate `git rm --cached`.
+passive_tapes/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/

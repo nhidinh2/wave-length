@@ -1,0 +1,6 @@
+criterion,status,basis
+filter_beats_unconditional,PASS,"best gated 0.2716 ticks vs unconditional 0.2551 at the same queue position sweep, zero rebate"
+positive_at_zero_rebate,PASS,best gated cell 0.2716 ticks/fill before any rebate
+significant_day_clustered,PASS,"t = 7.81 over 8 days, day-clustered"
+survives_back_of_queue,PASS,behind all displayed depth: 0.2502 ticks/fill on 1111 fills
+rebate_not_load_bearing,PASS,break-even needs -0.272 ticks of rebate (-0.00272 price units per share); a typical US add tier is 0.20-0.30 ticks

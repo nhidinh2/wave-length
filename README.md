@@ -19,7 +19,8 @@ attributed to the wave layer.
 
 | stage | status |
 |---|---|
-| **1. Order-book / OFI baseline** | built and measured — see below |
+| **1. Order-book / OFI baseline** | built and measured on two complete runs — see below |
+| 1b. Passive (maker) tradability | measured; promising but **not settled** — exit costs unmodelled |
 | 2. Wave / Duhamel response layer (`u_t`) | not started |
 | 3. Kinetic / Fokker–Planck layer | not started |
 
@@ -29,75 +30,47 @@ attributed to the wave layer.
 wave-length/
 ├── data/pilot/          20 days of INTC mbp-10 (dbn.zst + parquet), 4.7 GB
 └── ofi_research/        stage 1 — see ofi_research/README.md for the module map
-    ├── configs/         baseline_intc.json
+    ├── configs/         baseline_intc.json, passive_wf_intc.json
     ├── outputs/
-    │   ├── baseline/    tables + OFI_RESEARCH_REPORT.md
+    │   ├── baseline/    ORIGINAL M1-based run (superseded, kept for history)
+    │   ├── baseline_m5/ first complete run — taker + Phase 0 screen
+    │   ├── passive_wf/  current headline run — Phase 0 walk-forward
     │   └── pilot_audit/ one-day raw-to-feature audit (protocol gate)
-    └── tests/           149 tests
+    └── tests/           180 tests
 ```
+
+`outputs/passive_wf/` is the current reference. `outputs/baseline/` predates the
+`M5_full` reference model and mislabels M5 numbers as M1 — read it as history,
+not as a result.
 
 ---
 
 # Stage 1 — findings
 
 **Dataset.** INTC, XNAS.ITCH `mbp-10`, 20 trading days (2026-07-13 → 2026-08-07),
-~63M raw records → 2,158,686 decision rows at a 200 ms decision clock.
+**72.3M raw records → 68.6M canonical events → 2,158,686 decision rows** at a
+200 ms decision clock. (Earlier revisions of this file said "~63M raw records";
+that figure was wrong — the decision-row count is unchanged, so it is the same
+dataset.)
 Walk-forward: rolling 10/2/1 train/validation/test → **8 folds, 8 distinct test
 days** (2026-07-29 → 2026-08-07). Primary horizon **1 s**, selected by a fixed
 outcome-independent rule.
 
 ## 1. OFI predicts — weakly, but real
 
+Headline numbers are for **`M5_full`**, the reference model (not `M1_ofi`):
+
 | | value |
 |---|---|
-| Mean OOS correlation (M1) | **0.00728** |
-| Day-blocked 95% CI | **[0.00249, 0.01188]** |
-| Day-clustered t | 2.69 |
-| Folds with positive correlation | 6 / 8 |
+| Mean OOS correlation | **0.02214** |
+| Day-blocked 95% CI | **[0.01476, 0.02845]** |
+| Day-clustered t | 5.71 |
+| Folds with positive correlation | 8 / 8 |
 | Folds with positive β₁ | **8 / 8** |
 
-The interval excludes zero and the coefficient never changes sign. This is a
-genuine, consistently-signed relationship.
+The interval excludes zero and the coefficient never changes sign.
 
-## 2. It is far too small to trade aggressively
-
-Because models standardize on the training fold, `β₁` is directly "price move
-per 1-SD of OFI" and converts straight into ticks:
-
-| | value |
-|---|---|
-| Predicted move per 1-SD OFI | **0.0251 ticks** |
-| Mean quoted spread | **2.53 ticks** |
-| Ratio | **0.99%** |
-| SD of OFI needed to cover a round trip | **~101** |
-
-INTC in this sample is a **small-tick** name: median spread 3 ticks, only 10.95%
-of time at one tick. The round-trip cost gate is therefore the full spread
-(~2.4 ticks; fees, slippage and impact are all zero in the baseline config).
-
-## 3. The backtest executed zero trades — and that is a measurement, not a loss
-
-Across **857,973** out-of-sample rows:
-
-| funnel stage | count |
-|---|---|
-| Rows with a usable prediction | 857,973 |
-| … clearing the cost gate | **0** |
-| … clearing the z gate | 1 |
-| Signals | **0** |
-| Executed trades | **0** |
-| Largest single prediction, entire period | **1.37 ticks** (vs 2.38 needed) |
-
-Not one prediction in a month cleared the threshold, at *zero* latency. Since
-latency only delays execution and higher costs only raise the bar, every
-row of the cost and latency sweeps is provably zero.
-
-**Conclusion: OFI alone cannot support an aggressive taker strategy at this
-horizon on this symbol.** Tradability was *not evaluated* — it was never
-exercised. That is an absence of trading evidence, not evidence of
-unprofitability, and the two are now reported differently.
-
-## 4. The full specification is 3× better than OFI alone
+## 2. The full specification is 3× better than OFI alone
 
 | model | OOS corr | OOS R² | dir. acc |
 |---|---|---|---|
@@ -108,135 +81,226 @@ unprofitability, and the two are now reported differently.
 | M2 `+spread/depth` | 0.01894 | +0.000296 | 51.42% |
 | **M5 full** | **0.02214** | **+0.000425** | **51.66%** |
 
-M1 — which every headline number in the original report was based on — has
-**negative** out-of-sample R² and directional accuracy **below a coin flip**.
-M5 corresponds to `θ₁·OFI + θ₂·intensity + θ₃·Δspread`, i.e. the target
-equation minus `u_t`, and most of its gain comes from spread/depth (M2), not
-from intensity or signed volume.
+M1 has **negative** out-of-sample R² and directional accuracy **below a coin
+flip**. Most of M5's gain comes from spread/depth (M2), not from intensity or
+signed volume. **This is the baseline `u_t` must beat.**
 
-**This is the baseline `u_t` must beat.** Benchmarking the wave layer against
-M1 would credit it with gains plain spread/depth already delivers.
+## 3. The aggressive taker path is dead
+
+A 1-SD move in the reference feature predicts **0.0145 ticks** against a
+**2.53-tick** mean spread — 0.57% of it, so ~174 SD would be needed to cover one
+round trip. The 20-day M5 run (`outputs/baseline_m5/`) executed **1 trade** from
+857,967 eligible rows: 72 cleared the cost gate, 1 cleared the z gate.
+
+That single trade won 4 ticks, and the decision gate duly reported "net-positive
+out of sample" beside a concentration FAIL saying 100% of P&L came from one day.
+Both sentences described the same trade. See *Work completed (2026-09-13)*.
+
+**Conclusion: OFI alone cannot support an aggressive taker strategy at this
+horizon on this symbol.** The taker study is off by default
+(`evaluation.run_taker_backtest = False`) — it is a settled conclusion, not a
+bug, and re-deriving it costs ~25 min per run.
 
 ---
 
-# Work completed (2026-08-12)
+# Stage 1b — the passive (maker) path
 
-## Three reporting bugs, each of which changed a conclusion
+The strategy question moved here, because a maker earns the spread rather than
+paying it. Two studies, in increasing order of honesty.
 
-1. **Day-count conflation.** One `n_days` field served as both trading-day and
-   market-day count, so a report could simultaneously claim 0, 8, and "fewer
-   than two" out-of-sample days. Folds, market dates, dates with predictions
-   and dates with trades are now four separate printed quantities.
+## Phase 0 — front-of-queue screen (a ceiling)
 
-2. **Per-trade P&L averaged over folds, not pooled.** A mean of fold means
-   weights a 1-trade fold like a 50-trade fold, and inverted the reported sign:
-   **+0.32 ticks/trade against a true −1.36**, sitting beside the pooled total
-   in the same table.
+Assumes we are first in queue and fill on every trade at our price. Real queue
+position is strictly worse, so an unprofitable ceiling would be decisive.
 
-3. **Concentration share went negative.** `max_day/total` is undefined when the
-   total is negative, so a one-day-dominated **loss** passed the "< 0.6"
-   concentration gate. Now `|max day| / Σ|daily|`, bounded in [0, 1]. On
-   synthetic data this flipped a spurious PASS to a correct FAIL at 0.849.
+**Unconditional** front-of-queue markout at 1 s is **−0.0537 ticks** (t = −1.99)
+— the default maker business loses money at the best possible queue position.
 
-## A design error caught by a test
+**Conditioned on fill-aligned OFI**, fills separate cleanly:
 
-The passive screen originally used the taker study's Spearman monotonicity.
-That statistic reads ≈0 on maker data even when OFI predicts toxicity
-perfectly, because adverse selection is **symmetric** — negative OFI leaves you
-long into falling prices, positive leaves you short into rising ones, so
-markout against raw OFI is U-shaped. It would have produced a **false negative**
-killing the passive hypothesis. Fixed by conditioning on *fill-aligned* OFI
-(OFI signed by the position the fill leaves you in), which folds the U into a
-line.
+| | taker deciles | **passive deciles** |
+|---|---|---|
+| Spearman monotonicity | 0.556 | **0.879** |
+| Bottom → top spread | — | **0.183 ticks** |
 
-## Reporting made honest
+Worst decile −0.150 ticks, best **+0.089** — at zero rebate. So the edge is not
+in quoting, it is in **not** quoting into toxic flow, which makes the filter the
+strategy.
 
-- **Three-valued decision gate**: `PASS` / `FAIL` / `NOT_EVALUABLE`. A criterion
-  never exercised is not a failure. With zero trades, `net_positive`,
-  `not_one_day` and `survives_stress` are `NOT_EVALUABLE`.
-- **Execution accounting** (`19_`): the full signal funnel, so an empty ledger
-  can never again masquerade as a loss.
-- **Effect size in ticks and bps**, not just correlation.
-- **Real ablation deltas** in the answers, instead of "see the CSV".
-- Verdict text distinguishes "never traded" from "traded and lost".
+Decile edges here are cut pooled over the whole sample and therefore peek. That
+is why the walk-forward below exists.
 
-## New capability
+## Phase 0 walk-forward — the fitted gate (`outputs/passive_wf/`)
 
-- `passive.py` — **Phase 0**: a front-of-queue passive-markout screen that
-  bounds market-making performance from the MBP-10 data already on disk. Real
-  queue position is always worse, so an unprofitable bound is decisive and no
-  market-by-order data need be bought. Tables `20`–`22`. **Never yet run on
-  real data.**
-- `costs.maker_rebate_per_unit` — the cost model previously had no concept of a
-  rebate, only a symmetric charge applied twice. Defaults to 0 and says so
-  loudly; at a $0.01 tick a typical add rebate is 0.2–0.3 ticks.
-- `evaluation.reference_model` (default `M5_full`) — the model every headline
-  tracks, replacing `M1_ofi` hardcoded in 13 places.
-- `evaluation.run_cks_replication` (default **off**) — CKS is a construction
-  audit, not the model.
-- `phase0` CLI subcommand — runs the passive screen without the walk-forward.
-- 14 new tests (**149 total**).
+Strictly harder than the screen on four axes: the gate threshold is fitted on
+**train days only**, queue position is a swept dial rather than a free
+assumption, cancels are assumed to leave from behind us, and both quoting and
+cancelling pay latency. Fills simulate at event resolution; the gate stays on
+the 200 ms decision clock.
 
-## CKS bin-count anomaly — diagnosed and fixed
+All five passive criteria PASS and the report says **Proceed: YES**.
+**Do not act on that verdict yet** — three problems, in order of severity.
 
-Bin counts should fall monotonically as the window widens. They did not:
+### 1. Exit costs are omitted, and they dominate
 
-| window | expected bins | actual | |
+Table `23` carries `markout_after_crossing_out_ticks` — markout minus half the
+spread, i.e. the cost of flattening the position — and **no gate criterion
+consults it**:
+
+| gate | queue | markout | after crossing out |
 |---|---|---|---|
-| 10 s | 46,800 | 46,560 | ✓ |
-| 5 s | 93,600 | 93,120 | ✓ |
-| 1 s | 468,000 | 463,400 | ✓ |
-| 500 ms | 936,000 | 838,046 | ✓ |
-| **100 ms** | **4,680,000** | **62,197** | ✗ **1.3%** |
+| 0.3 | 0.00 | +0.272 | **−0.980** |
+| 0.3 | 0.25 | +0.121 | **−1.138** |
+| 0.3 | 1.00 | +0.203 | **−1.007** |
 
-Cause: the decision clock is 200 ms, so a 100 ms bin sits **below the sampling
-resolution** — most bins are empty and few have the two observations needed to
-form a Δm. Windows narrower than `decision_interval_ms` are now dropped with a
-warning. Everything ≥ 500 ms was always sound.
+**All 20 zero-rebate cells fall in −1.156 … −0.945 ticks.** The headline assumes
+inventory unwinds at mid for free; a typical 0.20–0.30 tick add rebate still
+leaves roughly −0.7. The honest statement is a **bracket of [−1.0, +0.25] ticks
+per fill**, whose width is set by how much inventory unwinds passively — and
+inventory is not modelled at all (no limit, no unwind policy).
 
-## Housekeeping
+The same column exists in the Phase-0 screen (table `20`): −1.39 ticks at 1 s.
 
-228 lines of redundant prose removed (24.4% → 21.7% of non-blank lines), 98
-decorative banner lines collapsed, 9 unused imports removed, `ofi_research/`
-README rewritten to match the actual repo, stray synthetic outputs deleted, and
-stale Aug-11 artifacts quarantined in `outputs/baseline/_stale_20260811/`.
+### 2. Two criteria pass on noise, chosen from 100 cells
+
+* `filter_beats_unconditional` — 0.2716 vs 0.2551 is **+0.017 ticks against
+  SE 0.035**, about half a standard error. Down the gate column at front of
+  queue: 0.255 → 0.272 → 0.264 → 0.257 → 0.242. Flat and non-monotonic. The OFI
+  gate adds nothing measurable there; it only cuts fills 115k → 12k.
+* `survives_back_of_queue` — quotes the queue=1.0 / gate=0.9 cell: 1,111 fills,
+  SE 0.336, **t = 0.75**. The gate picks the largest point estimate across 100
+  cells with no multiplicity adjustment, and that cell is the noisiest.
+
+The back-of-queue claim is nonetheless defensible via a better cell:
+queue=1.0 / gate=0.3 gives **+0.203 ticks at t = 5.48**.
+
+### 3. Unexplained sign flip against Phase 0
+
+Same 20 days, both nominally unconditional and front-of-queue:
+
+| | markout @ 1 s | fills/day |
+|---|---|---|
+| Phase 0, table `20` | **−0.0537** | 2,961 |
+| Policy grid, gate=0 / queue=0 | **+0.2551** | 14,376 |
+
+`gq ≤ 0` sets `thr = −inf`, so both sides really are quoted always, and sides are
+pooled. The likely cause is that Phase 0 infers fills on the decision clock
+while the policy simulates at event resolution with queue mechanics — but until
+that is reconciled, **one of the two is mismeasuring**.
+
+### What is actually supported
+
+Gated passive markout is positive and significant across queue positions —
+t ≈ 3–5.5 in well-populated cells — **before exit costs**. That is a real signal
+and worth pursuing. It is **not** yet evidence that the maker business makes
+money.
+
+---
+
+# Work completed (2026-09-13)
+
+## Recovered the repository
+
+A `git revert` of the initial commit on 2026-08-14 deleted all 165 tracked files
+(−14,006 lines); three later `git reset --hard` cycles rebuilt `main` from that
+emptied state, leaving only the `passive_m5` outputs and orphaning each
+intervening commit. The tree was restored from `a857d85`, a strict superset of
+what `main` held. Recovered commits are tagged `recovered-a857d85`,
+`dangling-789bb54`, `dangling-a78580d`, `dangling-465a258`.
+
+## The decision gate no longer scores a ledger too thin to score
+
+`net_positive`, `not_one_day` and `survives_stress` read `NOT_EVALUABLE` unless
+the ledger clears **30 trades across ≥2 distinct days**
+(`evaluation.min_trades_for_pnl_gate`, `min_trade_days_for_pnl_gate`; `0`
+restores the old behaviour). The three-valued gate already existed to stop an
+*empty* ledger reading as a failure — that reasoning did not extend far enough,
+because a one-trade ledger supports a verdict no better than an empty one.
+
+The day floor earns its place independently: overlapping targets make same-day
+rows dependent, so a one-day ledger carries one effective observation however
+many trades it holds, and `not_one_day` reads 1.000 by arithmetic rather than by
+evidence.
+
+Two verdict strings also asserted more than the gate had established — one
+claimed the result "survives the tested costs and stress checks" while
+`survives_stress` was `NOT_EVALUABLE`; the other opened "predictive and
+net-positive out of sample" unconditionally. Both now condition on the criterion
+having been scored, and a thin ledger reads differently from "never traded".
+`pnl_gate_evaluable` is a pure function so the rule is testable without a run
+context. 8 tests added (**180 total**).
+
+## First Phase 0 walk-forward on real data
+
+`configs/passive_wf_intc.json`, 20 days, 4h55m wall clock. Findings and caveats
+above. The maker rebate is deliberately **not** set to a single value: the config
+sweeps `[0, 0.0010, 0.0020, 0.0025, 0.0030]` and the gate reports a break-even,
+so the output is a bracket rather than an invented venue number.
+
+## Reporting bug confirmed fixed
+
+`outputs/baseline_m5/` labels its uncertainty row `oos_pred_corr_M1` while
+carrying M5_full's value — those outputs predate the current reporting layer.
+The new run emits `oos_pred_corr_M5_full` correctly.
 
 ---
 
 # Known issues
 
-- **A full clean run has never completed.** The 2026-08-12 run was killed by the
-  OS at 06:21 (17 GB machine, 782k pageouts) after data prep, walk-forward,
-  deciles, ablation and leave-one-group-out. The current report is
-  **reconstructed** from the tables that run left on disk and is labelled as
-  such at the top. Its numbers are sound; `16`, `17`, `18` and all plots are
-  stale.
-- **`07b_leave_one_group_out` cost 54 minutes** to produce one 7-row table and
-  is the peak-memory stage. Disable it or raise `decision_interval_ms` before
-  the next full run.
-- **The current report is M1-based.** Regenerating against `M5_full` requires a
-  fresh run; per-fold M5 predictions were not retained.
-- **The execution path has never produced a trade on real data.** It is covered
-  by unit tests but has never been exercised end-to-end on INTC. If a stronger
-  model does trade, that code runs for the first time — check it deliberately.
-- **Phase 0 has never been run on real data.**
+- **Exit costs are unmodelled in every passive result.** The headline
+  `markout_ticks` assumes free unwinding at mid; `markout_after_crossing_out`
+  assumes crossing on every fill. Reality is between, and no criterion reports
+  the bracket. This is the single largest gap.
+- **The passive decision gate selects the best of 100 cells** without a
+  multiplicity adjustment, and `survives_back_of_queue` currently passes on a
+  t = 0.75 cell.
+- **Phase 0 and the policy grid disagree in sign** on the unconditional
+  front-of-queue markout (−0.054 vs +0.255). Unreconciled.
+- **Queue position cannot be measured from MBP-10** — it is swept, and the
+  bracket is the result.
+- **`07b_leave_one_group_out` cost 54 minutes** for one 7-row table and is the
+  peak-memory stage. Off by default.
 - One symbol only. `18_tick_regime` records the preregistration requirement:
   a large-tick name must be a **separate** replication, never pooled.
+- `outputs/passive_wf/passive_tapes/` is 556 MB of regenerable cache. It should
+  be gitignored rather than committed.
+
+## Memory — measured, not estimated
+
+The earlier runbook figure of ~9 GB/day was pessimistic, and one of its claims
+was wrong.
+
+| | runbook | measured 2026-09-13 |
+|---|---|---|
+| Peak RSS, largest day | ~8.5 GB | **6.71 GB** |
+| Accumulation across days | "does not accumulate" | **≈0.22 GB per session** |
+| Full 20-day run | ~3 h | **4 h 55 m** |
+
+Memory **does** accumulate: the per-day event frame is released, but the sampled
+200 ms rows persist, so RSS climbs (1.98 GB at day 10 → 5.36 GB at day 20) and
+the pace degrades from ~5 to ~15 min/day. The largest sessions are in the back
+half of the sample, which compounds it.
+
+With 113 GB of free disk macOS keeps extending the swap file, so the failure mode
+is slowness rather than the OOM kill seen in August. Free several GB before
+starting anyway.
+
+---
 
 # Next steps
 
-1. **Re-run against `M5_full`** with `07b` disabled — gives a clean, complete
-   baseline at the correct reference model. M5's predictions are ~3× M1's, so
-   it may trade, which would exercise the execution path for the first time.
-2. **Run Phase 0** to settle whether OFI predicts adverse selection well enough
-   for passive quoting. This is the only live *tradability* path; a 100× effect-
-   size gap will not be closed by `u_t`.
+1. **Close the exit-cost gap.** Add a criterion that reports the
+   [cross-out, no-cross-out] bracket instead of one end, and decide what
+   fraction of inventory realistically unwinds passively. Until this is done the
+   maker path has no verdict — the current PASS is the optimistic end of its own
+   bracket.
+2. **Reconcile Phase 0 against the policy grid**, and require significance
+   rather than the largest point estimate for `survives_back_of_queue`.
 3. **Then build `u_t`** — see the brief below.
 
-Note that (2) and (3) answer different questions. The wave layer can be
-validated as a **predictive improvement** even if the signal is never tradable
-through aggressive execution — just don't let a positive Δcorr be read as
-"now it trades."
+Note that (1)–(2) and (3) answer different questions. The wave layer can be
+validated as a **predictive improvement** even if the signal is never tradable —
+just don't let a positive Δcorr be read as "now it trades."
 
 ---
 
@@ -344,4 +408,6 @@ and R² −0.000032 → +0.000425. A wave layer that adds less than the spread/d
 group already contributes is not yet interesting.
 
 **Do not judge `u_t` on P&L.** The taker path is dead by a factor of 100 and no
-kernel closes that. Tradability is Phase 0's question, not stage 2's.
+kernel closes that. Tradability is the passive path's question, not stage 2's —
+and that question is still open on exit costs (see *Stage 1b*), so there is no
+P&L number for a kernel to improve on yet.
